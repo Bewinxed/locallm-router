@@ -1,0 +1,11 @@
+{
+	"$schema": "https://jsrepo.dev/schema.json",
+	"repos": ["@ieedan/shadcn-svelte-extras"],
+	"paths": {
+		"ui": "src/lib/components/ui",
+		"hook": "src/lib/hooks",
+		"action": "src/lib/actions",
+		"lib": "src/lib",
+		"util": "src/lib/utils"
+	}
+}

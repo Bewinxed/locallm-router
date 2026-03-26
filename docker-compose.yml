@@ -1,0 +1,29 @@
+services:
+  center:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        LLAMA_CPP_VERSION: b8180
+    container_name: locallm-router
+    restart: unless-stopped
+    ports:
+      - "${PROXY_PORT:-30000}:30000"
+      - "${DASHBOARD_PORT:-30001}:30001"
+      - "${MANAGEMENT_PORT:-30099}:30099"
+    volumes:
+      - ${HF_HOME:-./models}:/models
+      - ./config.json:/app/config.json:ro
+    environment:
+      - LLM_ROUTER_CONFIG=/app/config.json
+      - HF_HOME=/models
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+      - HF_TOKEN=${HF_TOKEN:-}
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

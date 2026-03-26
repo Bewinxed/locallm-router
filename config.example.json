@@ -1,0 +1,41 @@
+{
+  "port": 30000,
+  "managementPort": 30099,
+  "models": [
+    {
+      "name": "my-model",
+      "modelPath": "org/model-name",
+      "parameterCount": 7,
+      "gpu": 0,
+      "idleTimeout": 300000,
+      "dtype": "bfloat16",
+      "extraArgs": [
+        "--gpu-memory-utilization", "0.85",
+        "--max-model-len", "8192"
+      ]
+    },
+    {
+      "name": "my-gguf-model",
+      "backend": "llama-server",
+      "modelPath": "/models/my-model.gguf",
+      "parameterCount": 35,
+      "activatedParameterCount": 3,
+      "vramGB": 22,
+      "gpu": 1,
+      "idleTimeout": 300000,
+      "aliases": ["default"],
+      "balanceGpus": [0, 1],
+      "extraArgs": [
+        "-ngl", "999",
+        "-c", "32768",
+        "-fa", "on",
+        "--cache-type-k", "q8_0",
+        "--cache-type-v", "q8_0",
+        "-np", "1",
+        "--jinja"
+      ]
+    }
+  ],
+  "healthCheckInterval": 5000,
+  "startupTimeout": 1800000
+}

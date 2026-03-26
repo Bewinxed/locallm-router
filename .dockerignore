@@ -1,0 +1,10 @@
+.git
+node_modules
+dashboard/node_modules
+dashboard/.svelte-kit
+dashboard/build
+*.log
+*.so
+*.so.*
+llama-server
+.env

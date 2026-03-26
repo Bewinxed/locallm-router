@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+dashboard/node_modules/
+
+# Build outputs
+dashboard/.svelte-kit/
+dashboard/build/
+
+# Environment and local config
+.env
+config.json
+
+# Models cache
+models/
+
+# Binary artifacts (built in Docker)
+*.so
+*.so.*
+llama-server
+llama-cli
+llama-gguf-split
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
