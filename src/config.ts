@@ -30,6 +30,8 @@ export interface ModelConfig {
   activatedParameterCount?: number;
   /** Manual VRAM override in GB (total across all GPUs). Bypasses automatic estimation. */
   vramGB?: number;
+  /** Eviction priority (default: 0). Higher = harder to evict. Models with equal priority use LRU. */
+  priority?: number;
   /** Aliases: additional model names that route to this model */
   aliases?: string[];
   /**

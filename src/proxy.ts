@@ -334,9 +334,22 @@ export class UnifiedProxy {
 
   private async stopEntry(entry: ModelEntry): Promise<void> {
     this.clearIdleTimer(entry.config.name);
-    if (!isEntryRunning(entry)) return;
+    if (!isEntryRunning(entry) && entry.process.status !== "sleeping") return;
     await entry.process.stop();
     this.gpuLock.notifyStopped(makeGpuOwner(entry));
+  }
+
+  /** Try to sleep instead of kill (vLLM only). Falls back to full stop. */
+  private async sleepOrStop(entry: ModelEntry): Promise<void> {
+    if (entry.process.supportsSleep && entry.process.status === "running") {
+      const slept = await entry.process.sleep();
+      if (slept) {
+        this.clearIdleTimer(entry.config.name);
+        this.gpuLock.notifyStopped(makeGpuOwner(entry));
+        return;
+      }
+    }
+    await this.stopEntry(entry);
   }
 
   private async stopBalanceShadows(baseName: string, primaryEntry?: ModelEntry): Promise<void> {
@@ -701,12 +714,28 @@ export class UnifiedProxy {
     // Step 2: Start backend if not running
     if (entry.process.status !== "running") {
       const owner = makeGpuOwner(entry);
+      const isSleeping = entry.process.status === "sleeping";
+
+      if (this.gpuLock.isRecentlyEvicted(entry.config.name)) {
+        console.warn(`[${entry.config.name}] Recently evicted, cooling down to prevent thrash`);
+      }
+
+      const preVRAM = isSleeping ? 0 : await this.gpuLock.snapshotVRAM(owner);
       await this.gpuLock.acquire(owner);
-      const gpuStr = entry.config.gpus
-        ? `GPUs ${entry.config.gpus.join(",")}`
-        : `GPU ${entry.config.gpu}`;
-      console.log(`[${entry.config.name}] Cold start — launching ${entry.config.backend || "vllm"} on ${gpuStr}...`);
+
+      if (isSleeping) {
+        console.log(`[${entry.config.name}] Waking from sleep mode...`);
+      } else {
+        const gpuStr = entry.config.gpus
+          ? `GPUs ${entry.config.gpus.join(",")}`
+          : `GPU ${entry.config.gpu}`;
+        console.log(`[${entry.config.name}] Cold start — launching ${entry.config.backend || "vllm"} on ${gpuStr}...`);
+      }
       await entry.process.start();
+
+      if (!isSleeping) {
+        this.gpuLock.recordObservedVRAM(owner, preVRAM).catch(() => {});
+      }
     }
 
     entry.process.touchActivity();
@@ -865,14 +894,13 @@ export class UnifiedProxy {
         const idleTime = Date.now() - entry.process.lastActivity;
         if (idleTime >= entry.config.idleTimeout && entry.process.status === "running") {
           console.log(
-            `[${entry.config.name}] Idle for ${Math.round(idleTime / 1000 / 60)}min, stopping...`
+            `[${entry.config.name}] Idle for ${Math.round(idleTime / 1000 / 60)}min, sleeping/stopping...`
           );
-          await this.stopEntry(entry);
+          await this.sleepOrStop(entry);
           await this.stopBalanceShadows(entry.config.name, entry);
         }
       } catch (err) {
         console.error(`[${entry.config.name}] Error during idle unload:`, err);
-        // Force kill if stop() failed
         try {
           await entry.process.stop();
         } catch { /* already logged */ }
@@ -902,10 +930,10 @@ export class UnifiedProxy {
         const idleTime = Date.now() - entry.process.lastActivity;
         if (idleTime >= entry.config.idleTimeout) {
           console.log(
-            `[idle-sweep] ${entry.config.name} idle for ${Math.round(idleTime / 1000 / 60)}min, stopping...`
+            `[idle-sweep] ${entry.config.name} idle for ${Math.round(idleTime / 1000 / 60)}min, sleeping/stopping...`
           );
           try {
-            await this.stopEntry(entry);
+            await this.sleepOrStop(entry);
             await this.stopBalanceShadows(entry.config.name, entry);
           } catch (err) {
             console.error(`[idle-sweep] Error stopping ${entry.config.name}:`, err);

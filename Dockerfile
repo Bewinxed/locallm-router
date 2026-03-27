@@ -32,7 +32,7 @@ RUN mkdir -p /out && \
 FROM nvidia/cuda:12.6.3-devel-ubuntu24.04 AS python-deps
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip curl ca-certificates \
+    python3 python3-pip curl git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
@@ -40,12 +40,10 @@ ENV UV_SYSTEM_PYTHON=1 UV_LINK_MODE=copy UV_BREAK_SYSTEM_PACKAGES=1
 
 # Bump this to force re-download of vLLM nightly (otherwise layer stays cached)
 ARG VLLM_CACHE_BUST=2026-02-28
-# WSL2 drops TCP on sustained large downloads; limit concurrency + retry loop
-RUN for i in 1 2 3 4 5; do \
-      UV_CONCURRENT_DOWNLOADS=2 uv pip install vllm hf_transfer aiohttp Pillow \
-        --extra-index-url https://wheels.vllm.ai/nightly && break || \
-      echo "Attempt $i failed, retrying in 15s..." && sleep 15; \
-    done
+# All deps pre-downloaded locally (WSL2 mirrored networking drops sustained downloads)
+COPY wheels/ /tmp/wheels/
+RUN uv pip install --no-index --find-links /tmp/wheels vllm hf_transfer aiohttp Pillow && rm -rf /tmp/wheels
+RUN uv pip install git+https://github.com/vllm-project/vllm-omni.git --upgrade
 
 # Bypass vLLM P2P check for consumer GPUs (WSL2)
 RUN CUDA_PY=$(find /usr/local/lib -path "*/vllm/platforms/cuda.py" 2>/dev/null | head -1) && \

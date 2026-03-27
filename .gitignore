@@ -13,6 +13,9 @@ config.json
 # Models cache
 models/
 
+# Pre-downloaded wheels (large, local only)
+wheels/
+
 # Binary artifacts (built in Docker)
 *.so
 *.so.*

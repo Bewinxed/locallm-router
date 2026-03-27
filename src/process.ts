@@ -140,7 +140,7 @@ async function waitForStateTransition(state: ProcessState, timeoutMs: number): P
 
 export interface ProcessState {
   process: ChildProcess | null;
-  status: "stopped" | "starting" | "running" | "stopping";
+  status: "stopped" | "starting" | "running" | "stopping" | "sleeping";
   lastActivity: number;
   startedAt: number | null;
   error: string | null;
@@ -156,6 +156,12 @@ export interface BackendProcess {
   healthCheck(): Promise<boolean>;
   getInternalUrl(): string;
   getState(): ProcessState & { name: string };
+  /** Put the model to sleep (offload weights to CPU). Only supported by vLLM. */
+  sleep(): Promise<boolean>;
+  /** Wake a sleeping model. Only supported by vLLM. */
+  wake(): Promise<boolean>;
+  /** Whether this backend supports sleep/wake */
+  readonly supportsSleep: boolean;
   /** Swap in a new ModelConfig. Takes effect on next start(). Process must be stopped first. */
   updateConfig(config: ModelConfig): void;
   /** Get the current config */
@@ -234,6 +240,7 @@ export class VLLMProcess implements BackendProcess {
 
   get status() { return this.state.status; }
   get lastActivity() { return this.state.lastActivity; }
+  get supportsSleep() { return true; }
   touchActivity() { this.state.lastActivity = Date.now(); }
   getConfig(): ModelConfig { return this.config; }
   updateConfig(config: ModelConfig): void {
@@ -244,12 +251,18 @@ export class VLLMProcess implements BackendProcess {
   }
 
   async start(): Promise<void> {
+    if (this.state.status === "sleeping") {
+      await this.wake();
+      return;
+    }
+
     const args = [
       "serve", this.config.modelPath,
       "--port", this.internalPort.toString(),
       "--host", "127.0.0.1",
       "--dtype", this.config.dtype || "bfloat16",
       "--served-model-name", this.config.name,
+      "--enable-sleep-mode",
       ...(this.config.extraArgs || []),
     ];
 
@@ -257,6 +270,7 @@ export class VLLMProcess implements BackendProcess {
       ...process.env,
       CUDA_VISIBLE_DEVICES: cudaDevices(this.config),
       ...ncclEnv(this.config),
+      VLLM_SERVER_DEV_MODE: "1",
       FLASH_ATTN: "1",
       OMP_NUM_THREADS: "6",
       VLLM_CPU_KVCACHE_SPACE: "8",
@@ -277,6 +291,47 @@ export class VLLMProcess implements BackendProcess {
       (text) => text.includes("Uvicorn running") || text.includes("Application startup complete"),
       "vLLM"
     );
+  }
+
+  async sleep(): Promise<boolean> {
+    if (this.state.status !== "running") return false;
+    try {
+      const r = await fetch(`http://127.0.0.1:${this.internalPort}/sleep?level=1`, {
+        method: "POST",
+        signal: AbortSignal.timeout(30000),
+      });
+      if (r.ok) {
+        this.state.status = "sleeping";
+        console.log(`[${this.config.name}] Entered sleep mode (weights offloaded to CPU)`);
+        return true;
+      }
+      console.warn(`[${this.config.name}] Sleep request failed: ${r.status}`);
+      return false;
+    } catch (err) {
+      console.warn(`[${this.config.name}] Sleep request error:`, err);
+      return false;
+    }
+  }
+
+  async wake(): Promise<boolean> {
+    if (this.state.status !== "sleeping") return false;
+    try {
+      const r = await fetch(`http://127.0.0.1:${this.internalPort}/wake_up`, {
+        method: "POST",
+        signal: AbortSignal.timeout(60000),
+      });
+      if (r.ok) {
+        this.state.status = "running";
+        this.state.lastActivity = Date.now();
+        console.log(`[${this.config.name}] Woke up from sleep mode`);
+        return true;
+      }
+      console.warn(`[${this.config.name}] Wake request failed: ${r.status}`);
+      return false;
+    } catch (err) {
+      console.warn(`[${this.config.name}] Wake request error:`, err);
+      return false;
+    }
   }
 
   async stop(): Promise<void> {
@@ -328,6 +383,7 @@ export class LlamaServerProcess implements BackendProcess {
 
   get status() { return this.state.status; }
   get lastActivity() { return this.state.lastActivity; }
+  get supportsSleep() { return false; }
   touchActivity() { this.state.lastActivity = Date.now(); }
   getConfig(): ModelConfig { return this.config; }
   updateConfig(config: ModelConfig): void {
@@ -336,6 +392,8 @@ export class LlamaServerProcess implements BackendProcess {
     }
     this.config = config;
   }
+  async sleep(): Promise<boolean> { return false; }
+  async wake(): Promise<boolean> { return false; }
 
   async start(): Promise<void> {
     const args = [
@@ -417,6 +475,7 @@ export class SGLangProcess implements BackendProcess {
 
   get status() { return this.state.status; }
   get lastActivity() { return this.state.lastActivity; }
+  get supportsSleep() { return false; }
   touchActivity() { this.state.lastActivity = Date.now(); }
   getConfig(): ModelConfig { return this.config; }
   updateConfig(config: ModelConfig): void {
@@ -425,6 +484,8 @@ export class SGLangProcess implements BackendProcess {
     }
     this.config = config;
   }
+  async sleep(): Promise<boolean> { return false; }
+  async wake(): Promise<boolean> { return false; }
 
   async start(): Promise<void> {
     const args = [

@@ -27,17 +27,26 @@ export interface GpuOwner {
 interface LoadedModel {
   owner: GpuOwner;
   estimate: ModelSizeEstimate;
+  observedVRAM: number | null;
   loadedAt: number;
   lastActivity: number;
 }
 
+interface EvictionRecord {
+  modelName: string;
+  evictedAt: number;
+}
+
 const VRAM_SAFETY_MARGIN = 0.95;
+const ANTI_THRASH_COOLDOWN_MS = 30_000;
+const VRAM_SNAPSHOT_SETTLE_MS = 3_000;
 
 class GpuScheduler {
   readonly gpu: number;
   private totalVRAM: number = 0;
   private loaded = new Map<string, LoadedModel>();
   private estimates = new Map<string, ModelSizeEstimate>();
+  private recentEvictions: EvictionRecord[] = [];
   private lastReconcileTime = 0;
   private static readonly RECONCILE_INTERVAL_MS = 5000;
 
@@ -82,9 +91,13 @@ class GpuScheduler {
     }
   }
 
+  private getModelVRAM(model: LoadedModel): number {
+    return model.observedVRAM ?? model.estimate.totalVRAM;
+  }
+
   private getEstimatedVRAM(): number {
     let total = 0;
-    for (const model of this.loaded.values()) total += model.estimate.totalVRAM;
+    for (const model of this.loaded.values()) total += this.getModelVRAM(model);
     return total;
   }
 
@@ -127,14 +140,57 @@ class GpuScheduler {
     return estimate.totalVRAM <= this.totalVRAM;
   }
 
+  /** Snapshot current GPU memory usage (call before model start) */
+  async snapshotVRAM(): Promise<number> {
+    const gpus = await getGpuInfo();
+    const gpuInfo = gpus.find((g) => g.index === this.gpu);
+    return gpuInfo ? gpuInfo.usedMemoryMB / 1024 : 0;
+  }
+
+  /** Record observed VRAM after a model finishes loading */
+  async recordObservedVRAM(owner: GpuOwner, preSnapshotGB: number): Promise<void> {
+    await new Promise((r) => setTimeout(r, VRAM_SNAPSHOT_SETTLE_MS));
+    const postGB = await this.snapshotVRAM();
+    const delta = Math.max(0, postGB - preSnapshotGB);
+    const model = this.loaded.get(owner.name);
+    if (!model || delta < 0.5) return;
+
+    model.observedVRAM = delta;
+    const estGB = model.estimate.totalVRAM;
+    const drift = Math.abs(delta - estGB);
+    if (drift > 1) {
+      console.log(
+        `[gpu-lock] GPU ${this.gpu}: ${owner.name} observed ${delta.toFixed(1)}GB (estimated ${estGB.toFixed(1)}GB, drift ${drift.toFixed(1)}GB)`
+      );
+    }
+  }
+
+  /** Check if a model was recently evicted (anti-thrash) */
+  isRecentlyEvicted(modelName: string): boolean {
+    const now = Date.now();
+    this.recentEvictions = this.recentEvictions.filter(
+      (e) => now - e.evictedAt < ANTI_THRASH_COOLDOWN_MS
+    );
+    return this.recentEvictions.some((e) => e.modelName === modelName);
+  }
+
+  private recordEviction(modelName: string): void {
+    this.recentEvictions.push({ modelName, evictedAt: Date.now() });
+  }
+
   private getEvictionCandidates(neededVRAM: number): GpuOwner[] {
-    const candidates = [...this.loaded.values()].sort((a, b) => a.lastActivity - b.lastActivity);
+    const candidates = [...this.loaded.values()].sort((a, b) => {
+      const pa = a.owner.config.priority ?? 0;
+      const pb = b.owner.config.priority ?? 0;
+      if (pa !== pb) return pa - pb;
+      return a.lastActivity - b.lastActivity;
+    });
     const toEvict: GpuOwner[] = [];
     let freedVRAM = 0;
     for (const model of candidates) {
       if (freedVRAM >= neededVRAM) break;
       toEvict.push(model.owner);
-      freedVRAM += model.estimate.totalVRAM;
+      freedVRAM += this.getModelVRAM(model);
     }
     return toEvict;
   }
@@ -158,7 +214,7 @@ class GpuScheduler {
 
     if (estimate.totalVRAM <= available) {
       console.log(`[gpu-lock] GPU ${this.gpu}: ${owner.name} fits (need ${estimate.totalVRAM.toFixed(1)}GB, have ${available.toFixed(1)}GB)`);
-      this.loaded.set(owner.name, { owner, estimate, loadedAt: Date.now(), lastActivity: Date.now() });
+      this.loaded.set(owner.name, { owner, estimate, observedVRAM: null, loadedAt: Date.now(), lastActivity: Date.now() });
       return;
     }
 
@@ -176,13 +232,14 @@ class GpuScheduler {
     for (const victim of toEvict) {
       try {
         await victim.stopProcess();
+        this.recordEviction(victim.name);
         this.loaded.delete(victim.name);
       } catch (err) {
         console.error(`[gpu-lock] GPU ${this.gpu}: failed to evict ${victim.name}:`, err);
       }
     }
 
-    this.loaded.set(owner.name, { owner, estimate, loadedAt: Date.now(), lastActivity: Date.now() });
+    this.loaded.set(owner.name, { owner, estimate, observedVRAM: null, loadedAt: Date.now(), lastActivity: Date.now() });
   }
 
   touchActivity(owner: GpuOwner): void {
@@ -208,7 +265,10 @@ class GpuScheduler {
       availableVRAM: Math.round(this.getAvailableVRAM() * 100) / 100,
       loaded: [...this.loaded.entries()].map(([name, m]) => ({
         name,
-        vram: m.estimate.totalVRAM,
+        estimatedVRAM: m.estimate.totalVRAM,
+        observedVRAM: m.observedVRAM,
+        effectiveVRAM: this.getModelVRAM(m),
+        priority: m.owner.config.priority ?? 0,
         lastActivity: m.lastActivity,
       })),
     };
@@ -251,6 +311,28 @@ export class GpuLock {
       if (!scheduler) throw new Error(`GPU ${gpuIdx} not registered`);
       await scheduler.acquire(owner);
     }
+  }
+
+  /** Snapshot VRAM on the primary GPU before a model starts */
+  async snapshotVRAM(owner: GpuOwner): Promise<number> {
+    const primaryGpu = this.gpuIndices(owner)[0];
+    const scheduler = this.schedulers.get(primaryGpu);
+    return scheduler ? scheduler.snapshotVRAM() : 0;
+  }
+
+  /** Record observed VRAM after a model finishes loading */
+  async recordObservedVRAM(owner: GpuOwner, preSnapshotGB: number): Promise<void> {
+    const primaryGpu = this.gpuIndices(owner)[0];
+    const scheduler = this.schedulers.get(primaryGpu);
+    if (scheduler) await scheduler.recordObservedVRAM(owner, preSnapshotGB);
+  }
+
+  /** Check if a model was recently evicted (anti-thrash cooldown) */
+  isRecentlyEvicted(modelName: string): boolean {
+    for (const scheduler of this.schedulers.values()) {
+      if (scheduler.isRecentlyEvicted(modelName)) return true;
+    }
+    return false;
   }
 
   notifyStopped(owner: GpuOwner): void {
