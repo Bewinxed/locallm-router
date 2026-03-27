@@ -10,8 +10,8 @@ export interface ModelConfig {
   name: string;
   /** HuggingFace repo ID (for vllm/sglang) or absolute path to GGUF file (for llama-server) */
   modelPath: string;
-  /** Backend: "vllm" (default), "llama-server", or "sglang" */
-  backend?: "vllm" | "llama-server" | "sglang";
+  /** Backend: "vllm" (default), "llama-server", "sglang", or "kestrel" */
+  backend?: "vllm" | "llama-server" | "sglang" | "kestrel";
   /** GPU device index (single GPU) */
   gpu: number;
   /** GPU device indices for multi-GPU (tensor parallel). Overrides gpu if set. */

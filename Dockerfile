@@ -40,7 +40,12 @@ ENV UV_SYSTEM_PYTHON=1 UV_LINK_MODE=copy UV_BREAK_SYSTEM_PACKAGES=1
 
 # Bump this to force re-download of vLLM nightly (otherwise layer stays cached)
 ARG VLLM_CACHE_BUST=2026-02-28
-RUN uv pip install vllm hf_transfer --extra-index-url https://wheels.vllm.ai/nightly
+# WSL2 drops TCP on sustained large downloads; limit concurrency + retry loop
+RUN for i in 1 2 3 4 5; do \
+      UV_CONCURRENT_DOWNLOADS=2 uv pip install vllm hf_transfer aiohttp Pillow \
+        --extra-index-url https://wheels.vllm.ai/nightly && break || \
+      echo "Attempt $i failed, retrying in 15s..." && sleep 15; \
+    done
 
 # Bypass vLLM P2P check for consumer GPUs (WSL2)
 RUN CUDA_PY=$(find /usr/local/lib -path "*/vllm/platforms/cuda.py" 2>/dev/null | head -1) && \
