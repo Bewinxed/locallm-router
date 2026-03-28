@@ -44,9 +44,10 @@ ENV VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:${PATH}"
 # Bump this to force re-download of vLLM nightly (otherwise layer stays cached)
 ARG VLLM_CACHE_BUST=2026-02-28
 # All deps pre-downloaded locally (WSL2 mirrored networking drops sustained downloads)
+RUN uv pip install "setuptools>=77.0.3,<81.0.0" wheel "setuptools-scm>=8.0"
 COPY wheels/ /tmp/wheels/
-RUN uv pip install --no-index --find-links /tmp/wheels vllm hf_transfer aiohttp Pillow && rm -rf /tmp/wheels
-RUN uv pip install git+https://github.com/vllm-project/vllm-omni.git --upgrade
+RUN uv pip install --no-build-isolation --no-index --find-links /tmp/wheels \
+      vllm vllm-omni hf_transfer aiohttp Pillow && rm -rf /tmp/wheels
 
 # Bypass vLLM P2P check for consumer GPUs (WSL2)
 RUN CUDA_PY=$(find /usr/local/lib -path "*/vllm/platforms/cuda.py" 2>/dev/null | head -1) && \
