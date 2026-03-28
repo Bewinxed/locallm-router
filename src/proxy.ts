@@ -446,15 +446,33 @@ export class UnifiedProxy {
 
     // ─── API requests — route by model field ────────────────
 
-    // Parse body for model field (only for methods with body)
+    // Extract `model` from the request body based on content type.
+    // JSON bodies are parsed and may be rewritten (model name normalization).
+    // Multipart bodies are parsed for routing only; raw bytes are forwarded unchanged.
     let body: any = null;
     let rawBody: ArrayBuffer | null = null;
     if (req.method !== "GET" && req.method !== "HEAD") {
+      const contentType = req.headers.get("content-type") || "";
       rawBody = await req.arrayBuffer();
-      try {
-        body = JSON.parse(new TextDecoder().decode(rawBody));
-      } catch {
-        // Not JSON — pass through
+
+      if (contentType.includes("multipart/form-data")) {
+        try {
+          const formData = await new Response(rawBody, {
+            headers: { "content-type": contentType },
+          }).formData();
+          const model = formData.get("model");
+          if (model && typeof model === "string") {
+            body = { model };
+          }
+        } catch {
+          // Malformed multipart — pass through, backend will reject
+        }
+      } else {
+        try {
+          body = JSON.parse(new TextDecoder().decode(rawBody));
+        } catch {
+          // Not JSON — pass through
+        }
       }
     }
 
