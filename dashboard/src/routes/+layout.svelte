@@ -25,6 +25,7 @@
 </script>
 
 <Toaster richColors closeButton position="bottom-right" />
+<Tooltip.Provider>
 
 <div class="flex h-screen w-screen overflow-hidden bg-background">
 	<!-- Sidebar: icon-only rail -->
@@ -62,3 +63,5 @@
 		{@render children()}
 	</main>
 </div>
+
+</Tooltip.Provider>
