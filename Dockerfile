@@ -36,7 +36,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
-ENV UV_SYSTEM_PYTHON=1 UV_LINK_MODE=copy UV_BREAK_SYSTEM_PACKAGES=1
+
+# Use a venv so all entry_points (huggingface-cli, vllm, etc.) are portable
+RUN uv venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:${PATH}"
 
 # Bump this to force re-download of vLLM nightly (otherwise layer stays cached)
 ARG VLLM_CACHE_BUST=2026-02-28
@@ -65,13 +68,12 @@ COPY --from=llama-builder /out/llama-server /usr/local/bin/
 COPY --from=llama-builder /out/llama-cli /usr/local/bin/
 COPY --from=llama-builder /out/llama-gguf-split /usr/local/bin/
 
-# Python site-packages with vLLM + torch (cached in stage 2)
-COPY --from=python-deps /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
-COPY --from=python-deps /usr/local/bin /usr/local/bin
+# Python venv with vLLM + torch + all CLI entrypoints intact
+COPY --from=python-deps /opt/venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:${PATH}"
 
 # uv (for any future runtime pip needs)
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
-ENV UV_SYSTEM_PYTHON=1 UV_LINK_MODE=copy UV_BREAK_SYSTEM_PACKAGES=1
 
 # Bun
 RUN curl -fsSL https://bun.sh/install | bash
