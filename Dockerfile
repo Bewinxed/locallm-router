@@ -26,8 +26,7 @@ RUN mkdir -p /out && \
 
 # ═══════════════════════════════════════════════════════════════
 # Stage 2: Python deps (vLLM + torch ~15GB)
-# Only rebuilds when VLLM_VERSION pin changes.
-# Separated so app code changes never re-download torch.
+# Only rebuilds when VLLM_VERSION pin or wheels/ changes.
 # ═══════════════════════════════════════════════════════════════
 FROM nvidia/cuda:12.6.3-devel-ubuntu24.04 AS python-deps
 
@@ -37,26 +36,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-# Use a venv so all entry_points (huggingface-cli, vllm, etc.) are portable
 RUN uv venv /opt/venv
 ENV VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:${PATH}"
 
-# Bump this to force re-download of vLLM nightly (otherwise layer stays cached)
 ARG VLLM_CACHE_BUST=2026-02-28
-# All deps pre-downloaded locally (WSL2 mirrored networking drops sustained downloads)
 RUN uv pip install "setuptools>=77.0.3,<81.0.0" wheel "setuptools-scm>=8.0"
 COPY wheels/ /tmp/wheels/
 RUN uv pip install --no-build-isolation --no-index --find-links /tmp/wheels \
       vllm vllm-omni hf_transfer aiohttp Pillow && rm -rf /tmp/wheels
 
-# Bypass vLLM P2P check for consumer GPUs (WSL2)
-RUN CUDA_PY=$(find /usr/local/lib -path "*/vllm/platforms/cuda.py" 2>/dev/null | head -1) && \
+RUN CUDA_PY=$(find /opt/venv -path "*/vllm/platforms/cuda.py" 2>/dev/null | head -1) && \
     if [ -n "$CUDA_PY" ]; then \
       sed -i 's/handles = \[pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids\]/return True/g' "$CUDA_PY"; \
     fi
 
 # ═══════════════════════════════════════════════════════════════
-# Stage 3: Final runtime image
+# Stage 3: Dashboard build (SvelteKit)
+# Only rebuilds when dashboard/ source changes.
+# Completely independent of Python/wheels.
+# ═══════════════════════════════════════════════════════════════
+FROM oven/bun:latest AS dashboard-builder
+
+WORKDIR /app/dashboard
+
+# Deps first (cached until lockfile changes)
+COPY dashboard/package.json dashboard/bun.lock ./
+RUN bun install --frozen-lockfile
+
+# Source + build
+COPY dashboard/svelte.config.js dashboard/vite.config.ts dashboard/tsconfig.json dashboard/components.json ./
+COPY dashboard/src ./src
+COPY dashboard/static ./static
+RUN bun run build
+
+# ═══════════════════════════════════════════════════════════════
+# Stage 4: Final runtime image
 # ═══════════════════════════════════════════════════════════════
 FROM nvidia/cuda:12.6.3-devel-ubuntu24.04
 
@@ -64,16 +78,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev curl unzip git libnuma-dev pciutils ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# llama.cpp binaries (cached in stage 1)
+# llama.cpp binaries
 COPY --from=llama-builder /out/llama-server /usr/local/bin/
 COPY --from=llama-builder /out/llama-cli /usr/local/bin/
 COPY --from=llama-builder /out/llama-gguf-split /usr/local/bin/
 
-# Python venv with vLLM + torch + all CLI entrypoints intact
+# Python venv with vLLM + torch + CLI entrypoints
 COPY --from=python-deps /opt/venv /opt/venv
 ENV VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:${PATH}"
 
-# uv (for any future runtime pip needs)
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
 # Bun
@@ -82,21 +95,11 @@ ENV PATH="/root/.bun/bin:${PATH}"
 
 WORKDIR /app
 
-# ─── Dashboard deps (cached until lockfile changes) ───────────
-COPY dashboard/package.json dashboard/bun.lock ./dashboard/
-WORKDIR /app/dashboard
-RUN bun install --frozen-lockfile
-WORKDIR /app
+# Pre-built dashboard (just the output, no node_modules)
+COPY --from=dashboard-builder /app/dashboard/build ./dashboard/build
+COPY --from=dashboard-builder /app/dashboard/package.json ./dashboard/
 
-# ─── Dashboard config + source + build ────────────────────────
-COPY dashboard/svelte.config.js dashboard/vite.config.ts dashboard/tsconfig.json dashboard/components.json ./dashboard/
-COPY dashboard/src ./dashboard/src
-COPY dashboard/static ./dashboard/static
-WORKDIR /app/dashboard
-RUN bun run build
-WORKDIR /app
-
-# ─── App code (changes most often — last layer) ──────────────
+# App code (changes most often — last layer)
 COPY src/ ./src/
 
 ENV LLM_ROUTER_CONFIG="/app/config.json"
