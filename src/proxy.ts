@@ -383,15 +383,10 @@ export class UnifiedProxy {
     return this.balancedModels.has(baseName);
   }
 
-  /** Extract model name from request body (JSON) or URL query param */
+  /** Extract model name from request (body or URL) */
   private async extractModelName(req: Request, body?: any): Promise<string | null> {
     if (body?.model) {
       return body.model;
-    }
-    const url = new URL(req.url);
-    const queryModel = url.searchParams.get("model");
-    if (queryModel) {
-      return queryModel;
     }
     return null;
   }
