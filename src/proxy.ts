@@ -911,9 +911,20 @@ export class UnifiedProxy {
       try {
         const idleTime = Date.now() - entry.process.lastActivity;
         if (idleTime >= entry.config.idleTimeout && entry.process.status === "running") {
-          console.log(
-            `[${entry.config.name}] Idle for ${Math.round(idleTime / 1000 / 60)}min, sleeping/stopping...`
-          );
+          const sleepDelay = entry.config.sleepDelay ?? 0;
+          if (sleepDelay > 0) {
+            console.log(
+              `[${entry.config.name}] Idle for ${Math.round(idleTime / 1000 / 60)}min, sleep in ${sleepDelay / 1000}s...`
+            );
+            await new Promise((r) => setTimeout(r, sleepDelay));
+            if (entry.process.status !== "running") return;
+            const freshIdle = Date.now() - entry.process.lastActivity;
+            if (freshIdle < entry.config.idleTimeout) return;
+          } else {
+            console.log(
+              `[${entry.config.name}] Idle for ${Math.round(idleTime / 1000 / 60)}min, sleeping/stopping...`
+            );
+          }
           await this.sleepOrStop(entry);
           await this.stopBalanceShadows(entry.config.name, entry);
         }
