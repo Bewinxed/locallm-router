@@ -259,7 +259,7 @@
 							<Label class="text-xs text-muted-foreground">Temperature</Label>
 							<span class="text-xs font-mono text-foreground">{temperature[0].toFixed(1)}</span>
 						</div>
-						<Slider bind:value={temperature} min={0} max={2} step={0.1} />
+						<Slider type="multiple" bind:value={temperature} min={0} max={2} step={0.1} />
 					</div>
 
 					<!-- Top P -->
@@ -268,7 +268,7 @@
 							<Label class="text-xs text-muted-foreground">Top P</Label>
 							<span class="text-xs font-mono text-foreground">{topP[0].toFixed(2)}</span>
 						</div>
-						<Slider bind:value={topP} min={0} max={1} step={0.05} />
+						<Slider type="multiple" bind:value={topP} min={0} max={1} step={0.05} />
 					</div>
 
 					<!-- Top K -->
@@ -277,7 +277,7 @@
 							<Label class="text-xs text-muted-foreground">Top K</Label>
 							<span class="text-xs font-mono text-foreground">{topK[0]}</span>
 						</div>
-						<Slider bind:value={topK} min={0} max={100} step={1} />
+						<Slider type="multiple" bind:value={topK} min={0} max={100} step={1} />
 					</div>
 
 					<!-- Max Tokens -->
@@ -286,7 +286,7 @@
 							<Label class="text-xs text-muted-foreground">Max Tokens</Label>
 							<span class="text-xs font-mono text-foreground">{maxTokens[0]}</span>
 						</div>
-						<Slider bind:value={maxTokens} min={1} max={8192} step={1} />
+						<Slider type="multiple" bind:value={maxTokens} min={1} max={8192} step={1} />
 					</div>
 
 					<!-- Presence Penalty -->
@@ -295,7 +295,7 @@
 							<Label class="text-xs text-muted-foreground">Presence Penalty</Label>
 							<span class="text-xs font-mono text-foreground">{presencePenalty[0].toFixed(1)}</span>
 						</div>
-						<Slider bind:value={presencePenalty} min={-2} max={2} step={0.1} />
+						<Slider type="multiple" bind:value={presencePenalty} min={-2} max={2} step={0.1} />
 					</div>
 
 					<!-- Frequency Penalty -->
@@ -304,7 +304,7 @@
 							<Label class="text-xs text-muted-foreground">Frequency Penalty</Label>
 							<span class="text-xs font-mono text-foreground">{frequencyPenalty[0].toFixed(1)}</span>
 						</div>
-						<Slider bind:value={frequencyPenalty} min={-2} max={2} step={0.1} />
+						<Slider type="multiple" bind:value={frequencyPenalty} min={-2} max={2} step={0.1} />
 					</div>
 				</div>
 			</ScrollArea.Root>

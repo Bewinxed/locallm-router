@@ -883,8 +883,13 @@ export class UnifiedProxy {
         status: entry.process.status,
         lastActivity: entry.process.lastActivity,
         downloading: entry.downloading,
+        downloadError: entry.downloadError,
         aliases: config.aliases || [],
         balance: group ? group.getStatus() : null,
+        gpu: config.gpu,
+        gpus: config.gpus,
+        priority: config.priority ?? 0,
+        sleepDelay: config.sleepDelay ?? 0,
       };
     });
   }

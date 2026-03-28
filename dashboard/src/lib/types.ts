@@ -14,12 +14,16 @@ export interface ModelStatus {
 	name: string;
 	backend: string;
 	modelPath: string;
-	status: 'stopped' | 'starting' | 'running' | 'stopping';
+	status: 'stopped' | 'starting' | 'running' | 'stopping' | 'sleeping';
 	lastActivity: number;
 	downloading: boolean;
 	downloadError: string | null;
 	aliases: string[];
 	balance: BalanceGroupStatus | null;
+	priority?: number;
+	sleepDelay?: number;
+	gpu?: number;
+	gpus?: number[];
 }
 
 export interface BalanceGroupStatus {

@@ -36,6 +36,8 @@
 		parameterCount?: number;
 		activatedParameterCount?: number;
 		vramGB?: number;
+		priority?: number;
+		sleepDelay?: number;
 		aliases?: string[];
 		balanceGpus?: number[];
 		balanceGpuArgs?: Record<string, string[]>;
@@ -536,6 +538,39 @@
 											bind:value={model.dtype}
 											placeholder="bfloat16"
 										/>
+									</div>
+								</div>
+
+								<!-- Row 3b: Priority, Sleep Delay -->
+								<div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
+									<div class="space-y-1.5">
+										<Label for="priority-{i}">Priority</Label>
+										<Input
+											id="priority-{i}"
+											type="number"
+											min="0"
+											value={model.priority ?? 0}
+											oninput={(e) => {
+												const val = parseInt(e.currentTarget.value);
+												model.priority = isNaN(val) ? 0 : val;
+											}}
+										/>
+										<p class="text-muted-foreground text-[11px]">Higher = harder to evict</p>
+									</div>
+									<div class="space-y-1.5">
+										<Label for="sleepdelay-{i}">Sleep Delay (s)</Label>
+										<Input
+											id="sleepdelay-{i}"
+											type="number"
+											min="0"
+											step="1"
+											value={Math.round((model.sleepDelay ?? 0) / 1000)}
+											oninput={(e) => {
+												const val = parseInt(e.currentTarget.value);
+												model.sleepDelay = isNaN(val) ? 0 : val * 1000;
+											}}
+										/>
+										<p class="text-muted-foreground text-[11px]">Grace period before sleep. 0 = immediate.</p>
 									</div>
 								</div>
 
