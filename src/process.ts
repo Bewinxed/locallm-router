@@ -296,9 +296,9 @@ export class VLLMProcess implements BackendProcess {
   async sleep(): Promise<boolean> {
     if (this.state.status !== "running") return false;
     try {
-      const r = await fetch(`http://127.0.0.1:${this.internalPort}/sleep?level=1`, {
+      const r = await fetch(`http://127.0.0.1:${this.internalPort}/sleep`, {
         method: "POST",
-        signal: AbortSignal.timeout(30000),
+        signal: AbortSignal.timeout(120000),
       });
       if (r.ok) {
         this.state.status = "sleeping";
