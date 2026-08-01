@@ -14,10 +14,10 @@
  */
 
 import type { ModelConfig } from "./config";
-import { getInternalPort, buildModelLookup, reloadModelConfig as reloadModelConfigFromDisk } from "./config";
-import { createProcess, type BackendProcess } from "./process";
+import { getInternalPort, reloadModelConfig as reloadModelConfigFromDisk } from "./config";
+import { createProcess, type BackendProcess, type ExitInfo } from "./process";
 import { downloadModel, isLocalModel } from "./download";
-import type { GpuLock } from "./gpu-lock";
+import { EvictionCooldownError, type GpuLock, type GpuOwner } from "./gpu-lock";
 
 // ─── Types ──────────────────────────────────────────────────────
 
@@ -27,16 +27,8 @@ export interface ModelEntry {
   internalPort: number;
   downloading: boolean;
   downloadError: string | null;
-}
-
-/** GpuOwner adapter so GpuLock can manage ModelEntry */
-export interface GpuOwner {
-  readonly name: string;
-  readonly gpu: number;
-  readonly gpus?: number[];
-  readonly config: ModelConfig;
-  isRunning(): boolean;
-  stopProcess(): Promise<void>;
+  /** Requests currently proxied to this entry, streams included. */
+  inflight: number;
 }
 
 /** Parsed model name with optional modifier */
@@ -160,6 +152,101 @@ class BalancedModelGroup {
 
 // ─── Helpers ────────────────────────────────────────────────────
 
+/** Body framing + hop-by-hop headers. fetch() re-frames and decodes for us. */
+const STRIPPED_REQUEST_HEADERS = [
+  "host",
+  "content-length",
+  "content-encoding",
+  "connection",
+  "transfer-encoding",
+];
+const STRIPPED_RESPONSE_HEADERS = ["content-encoding", "content-length", "transfer-encoding"];
+
+/** Runtime arg overrides accepted by /restart, and the shape of their values. */
+const RESTART_OVERRIDE_FLAGS = [
+  "-c",
+  "--ctx-size",
+  "--max-model-len",
+  "--gpu-memory-utilization",
+  "-ngl",
+];
+const RESTART_OVERRIDE_VALUE = /^[0-9.]+$/;
+
+/** Consecutive failed probes before a running backend is declared dead. */
+const HEALTH_FAILURES_BEFORE_STOP = 3;
+
+function stripHeaders(headers: Headers, names: string[]): Headers {
+  const out = new Headers(headers);
+  for (const name of names) out.delete(name);
+  return out;
+}
+
+/**
+ * Runtime overrides for /restart, from `?context=N` and/or a JSON body.
+ * Only known numeric flags are accepted — these end up on a command line.
+ */
+async function parseRestartOverrides(req: Request, url: URL): Promise<Record<string, string>> {
+  const overrides: Record<string, string> = {};
+
+  const context = url.searchParams.get("context");
+  if (context) overrides["-c"] = context;
+
+  const body = await req.json().catch(() => null);
+  if (body?.overrides && typeof body.overrides === "object") {
+    Object.assign(overrides, body.overrides);
+  }
+
+  for (const [flag, value] of Object.entries(overrides)) {
+    if (!RESTART_OVERRIDE_FLAGS.includes(flag)) {
+      throw new Error(
+        `Unsupported override flag "${flag}" (allowed: ${RESTART_OVERRIDE_FLAGS.join(", ")})`
+      );
+    }
+    if (typeof value !== "string" || !RESTART_OVERRIDE_VALUE.test(value)) {
+      throw new Error(`Override "${flag}" must be a numeric string`);
+    }
+  }
+
+  return overrides;
+}
+
+function isStreamingResponse(response: Response): boolean {
+  const contentType = response.headers.get("content-type") || "";
+  return contentType.includes("text/event-stream") || contentType.includes("stream");
+}
+
+/**
+ * Wrap a streamed body so `onDone` runs when it finishes, errors, or the
+ * client cancels. Bun never calls a TransformStream's `cancel`, so the hook
+ * hangs off a reader instead.
+ */
+function trackStreamEnd(
+  body: ReadableStream<Uint8Array>,
+  onDone: () => void
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          onDone();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (err) {
+        onDone();
+        controller.error(err);
+      }
+    },
+    cancel(reason) {
+      onDone();
+      return reader.cancel(reason);
+    },
+  });
+}
+
 function makeGpuOwner(entry: ModelEntry): GpuOwner {
   return {
     name: entry.config.name,
@@ -209,11 +296,16 @@ function allocateBalancePort(): number {
 
 export class UnifiedProxy {
   private models: Map<string, ModelEntry> = new Map();
-  private lookup: Map<string, ModelConfig>;
   private gpuLock: GpuLock;
   private server: ReturnType<typeof Bun.serve> | null = null;
   private idleTimers: Map<string, Timer> = new Map();
   private idleSweepTimer: Timer | null = null;
+  private healthTimer: Timer | null = null;
+  /** Consecutive failed health probes per model name */
+  private healthFailures: Map<string, number> = new Map();
+
+  /** Serializes lifecycle transitions per model — see withLifecycle(). */
+  private lifecycleQueues: Map<ModelEntry, Promise<unknown>> = new Map();
 
   /** Balance groups: base model name -> BalancedModelGroup */
   private balanceGroups: Map<string, BalancedModelGroup> = new Map();
@@ -221,21 +313,13 @@ export class UnifiedProxy {
   private balancedModels: Set<string> = new Set();
 
   constructor(configs: ModelConfig[], gpuLock: GpuLock) {
-    this.lookup = buildModelLookup(configs);
     this.gpuLock = gpuLock;
 
     // Create entries for each model
     for (let i = 0; i < configs.length; i++) {
       const config = configs[i];
       const internalPort = getInternalPort(i);
-      const proc = createProcess(config, internalPort);
-      const entry: ModelEntry = {
-        config,
-        process: proc,
-        internalPort,
-        downloading: false,
-        downloadError: null,
-      };
+      const entry = this.createEntry(config, internalPort);
       this.models.set(config.name, entry);
 
       // Register aliases
@@ -281,14 +365,7 @@ export class UnifiedProxy {
           }
 
           const balancePort = allocateBalancePort();
-          const balanceProc = createProcess(gpuConfig, balancePort);
-          const balanceEntry: ModelEntry = {
-            config: gpuConfig,
-            process: balanceProc,
-            internalPort: balancePort,
-            downloading: false,
-            downloadError: null,
-          };
+          const balanceEntry = this.createEntry(gpuConfig, balancePort);
 
           group.addInstance(gpu, balanceEntry);
 
@@ -316,6 +393,56 @@ export class UnifiedProxy {
     }
   }
 
+  private createEntry(config: ModelConfig, internalPort: number): ModelEntry {
+    let entry: ModelEntry;
+    const proc = createProcess(config, internalPort, (info) => this.handleBackendExit(entry, info));
+    entry = {
+      config,
+      process: proc,
+      internalPort,
+      downloading: false,
+      downloadError: null,
+      inflight: 0,
+    };
+    return entry;
+  }
+
+  /**
+   * Every backend exit lands here, crash or not: the GPU reservation goes back
+   * to the lock so the next request can cold-start instead of waiting on VRAM
+   * that nothing is using.
+   */
+  private handleBackendExit(entry: ModelEntry, info: ExitInfo): void {
+    this.clearIdleTimer(entry.config.name);
+    this.healthFailures.delete(entry.config.name);
+    entry.inflight = 0;
+    this.gpuLock.notifyStopped(makeGpuOwner(entry));
+    if (!info.expected) {
+      console.warn(
+        `[${entry.config.name}] Backend exited unexpectedly ` +
+          `(${info.signalCode ?? `code ${info.exitCode}`}) — GPU reservation released`
+      );
+    }
+  }
+
+  /**
+   * One lifecycle transition at a time per model: lazy start, management
+   * start/stop, restart, config reload, idle unload and the health sweep all
+   * queue here. Two of them driving the same BackendProcess is what leaves an
+   * orphaned backend holding the internal port. The per-GPU lock doesn't cover
+   * this — it arbitrates VRAM between models, not transitions within one.
+   *
+   * Eviction (GpuOwner.stopProcess) deliberately stays outside: it runs while
+   * the incoming model holds its own slot, and taking the victim's lock there
+   * would let two models on the same card wait on each other.
+   */
+  private withLifecycle<T>(entry: ModelEntry, transition: () => Promise<T>): Promise<T> {
+    const previous = this.lifecycleQueues.get(entry) ?? Promise.resolve();
+    const run = previous.then(transition, transition);
+    this.lifecycleQueues.set(entry, run.catch(() => {}));
+    return run;
+  }
+
   private getManagedEntries(): ModelEntry[] {
     const entries = new Map<string, ModelEntry>();
 
@@ -332,7 +459,11 @@ export class UnifiedProxy {
     return [...entries.values()];
   }
 
-  private async stopEntry(entry: ModelEntry): Promise<void> {
+  private stopEntry(entry: ModelEntry): Promise<void> {
+    return this.withLifecycle(entry, () => this.stopEntryLocked(entry));
+  }
+
+  private async stopEntryLocked(entry: ModelEntry): Promise<void> {
     this.clearIdleTimer(entry.config.name);
     if (!isEntryRunning(entry) && entry.process.status !== "sleeping") return;
     await entry.process.stop();
@@ -340,16 +471,18 @@ export class UnifiedProxy {
   }
 
   /** Try to sleep instead of kill (vLLM only). Falls back to full stop. */
-  private async sleepOrStop(entry: ModelEntry): Promise<void> {
-    if (entry.process.supportsSleep && entry.process.status === "running") {
-      const slept = await entry.process.sleep();
-      if (slept) {
-        this.clearIdleTimer(entry.config.name);
-        this.gpuLock.notifyStopped(makeGpuOwner(entry));
-        return;
+  private sleepOrStop(entry: ModelEntry): Promise<void> {
+    return this.withLifecycle(entry, async () => {
+      if (entry.process.supportsSleep && entry.process.status === "running") {
+        const slept = await entry.process.sleep();
+        if (slept) {
+          this.clearIdleTimer(entry.config.name);
+          this.gpuLock.notifyStopped(makeGpuOwner(entry));
+          return;
+        }
       }
-    }
-    await this.stopEntry(entry);
+      await this.stopEntryLocked(entry);
+    });
   }
 
   private async stopBalanceShadows(baseName: string, primaryEntry?: ModelEntry): Promise<void> {
@@ -367,7 +500,12 @@ export class UnifiedProxy {
     this.server = Bun.serve({
       port,
       idleTimeout: 255,
+      maxRequestBodySize: 64 * 1024 * 1024,
       fetch: (req) => this.handleRequest(req),
+      error: (err) => {
+        console.error("[proxy] Unhandled request error:", err);
+        return Response.json({ error: "Internal proxy error", details: String(err) }, { status: 500 });
+      },
     });
     console.log(`Unified proxy listening on port ${port}`);
     return this;
@@ -376,19 +514,6 @@ export class UnifiedProxy {
   /** Get a model entry, resolving aliases (no modifier parsing) */
   private getEntry(modelName: string): ModelEntry | undefined {
     return this.models.get(modelName);
-  }
-
-  /** Check if a base model name has balance mode enabled */
-  private isBalanced(baseName: string): boolean {
-    return this.balancedModels.has(baseName);
-  }
-
-  /** Extract model name from request (body or URL) */
-  private async extractModelName(req: Request, body?: any): Promise<string | null> {
-    if (body?.model) {
-      return body.model;
-    }
-    return null;
   }
 
   private async handleRequest(req: Request): Promise<Response> {
@@ -404,53 +529,18 @@ export class UnifiedProxy {
       return Response.json({ status: "ok", models: this.getModelsStatus() });
     }
 
-    if (url.pathname === "/manager/status") {
-      return Response.json({
-        models: this.getModelsStatus(),
-        gpus: await this.gpuLock.status(),
-        balanceGroups: this.getBalanceGroupsStatus(),
-      });
-    }
-
-    if (url.pathname === "/manager/stop-all" && req.method === "POST") {
-      for (const entry of this.getManagedEntries()) {
-        await this.stopEntry(entry);
-      }
-      return Response.json({ status: "all stopped" });
-    }
-
-    // ─── Model-specific management ──────────────────────────
-    const mgmtMatch = url.pathname.match(/^\/manager\/(\w+)\/(.+)$/);
-    if (mgmtMatch) {
-      const [, action, modelName] = mgmtMatch;
-      const entry = this.getEntry(modelName);
-      if (!entry) return Response.json({ error: `Unknown model: ${modelName}` }, { status: 404 });
-
-      if (action === "start" && req.method === "POST") {
-        try {
-          await this.ensureRunning(entry);
-          return Response.json({ status: "running" });
-        } catch (err) {
-          return Response.json({ error: String(err) }, { status: 500 });
-        }
-      }
-      if (action === "stop" && req.method === "POST") {
-        await this.stopEntry(entry);
-        await this.stopBalanceShadows(entry.config.name, entry);
-        return Response.json({ status: "stopped" });
-      }
-      if (action === "status") {
-        return Response.json(entry.process.getState());
-      }
+    if (url.pathname === "/manager" || url.pathname.startsWith("/manager/")) {
+      return this.handleManagement(req);
     }
 
     // ─── API requests — route by model field ────────────────
 
     // Extract `model` from the request body based on content type.
-    // JSON bodies are parsed and may be rewritten (model name normalization).
-    // Multipart bodies are parsed for routing only; raw bytes are forwarded unchanged.
+    // Only JSON bodies are re-encoded (model name normalization); anything
+    // else — multipart audio uploads especially — is forwarded byte for byte.
     let body: any = null;
     let rawBody: ArrayBuffer | null = null;
+    let jsonBody = false;
     if (req.method !== "GET" && req.method !== "HEAD") {
       const contentType = req.headers.get("content-type") || "";
       rawBody = await req.arrayBuffer();
@@ -470,13 +560,14 @@ export class UnifiedProxy {
       } else {
         try {
           body = JSON.parse(new TextDecoder().decode(rawBody));
+          jsonBody = contentType.includes("json");
         } catch {
           // Not JSON — pass through
         }
       }
     }
 
-    const modelName = await this.extractModelName(req, body);
+    const modelName: string | null = body?.model ?? null;
     if (!modelName) {
       return Response.json(
         {
@@ -508,7 +599,7 @@ export class UnifiedProxy {
 
     // ─── Balance routing ────────────────────────────────────
     if (parsed.modifier && group) {
-      return this.handleBalancedRequest(req, body, rawBody, parsed, group, baseEntry);
+      return this.handleBalancedRequest(req, body, rawBody, jsonBody, parsed, group, baseEntry);
     }
 
     // ─── Modifier used but model doesn't support it ─────────
@@ -532,25 +623,36 @@ export class UnifiedProxy {
         modifier: `gpu${baseEntry.config.gpu}`,
         targetGpu: baseEntry.config.gpu,
       };
-      return this.handleBalancedRequest(req, body, rawBody, implicitParsed, group, baseEntry);
+      return this.handleBalancedRequest(req, body, rawBody, jsonBody, implicitParsed, group, baseEntry);
     }
 
     try {
       await this.ensureRunning(baseEntry);
     } catch (err) {
-      return Response.json(
-        { error: "Model failed to start", details: String(err) },
-        { status: 503 }
-      );
+      return this.startFailureResponse(err);
     }
 
     // Rewrite model name in body to match what the backend expects
-    if (body && body.model !== baseEntry.config.name) {
+    if (jsonBody && body && body.model !== baseEntry.config.name) {
       body.model = baseEntry.config.name;
       rawBody = new TextEncoder().encode(JSON.stringify(body)).buffer as ArrayBuffer;
     }
 
     return this.proxyRequest(req, baseEntry, rawBody);
+  }
+
+  /** 503 for a model that could not start, with Retry-After during eviction cooldown. */
+  private startFailureResponse(err: unknown): Response {
+    if (err instanceof EvictionCooldownError) {
+      return Response.json(
+        { error: err.message, retry_after_seconds: err.retryAfterSeconds },
+        { status: 503, headers: { "Retry-After": String(err.retryAfterSeconds) } }
+      );
+    }
+    return Response.json(
+      { error: "Model failed to start", details: String(err) },
+      { status: 503 }
+    );
   }
 
   /**
@@ -561,6 +663,7 @@ export class UnifiedProxy {
     req: Request,
     body: any,
     rawBody: ArrayBuffer | null,
+    jsonBody: boolean,
     parsed: ParsedModelName,
     group: BalancedModelGroup,
     baseEntry: ModelEntry
@@ -634,17 +737,14 @@ export class UnifiedProxy {
           );
         }
       } else {
-        return Response.json(
-          { error: "Model failed to start", details: String(err) },
-          { status: 503 }
-        );
+        return this.startFailureResponse(err);
       }
     }
 
     // Rewrite model name to the base name (strip modifier) so the backend recognizes it.
     // The backend's -a (alias) flag is set to the base model name for the primary,
     // and the internal name for secondary instances. We need to match what llama-server expects.
-    if (body) {
+    if (jsonBody && body) {
       // llama-server uses -a flag to set served model name.
       // Primary instance: served as config.name (e.g. "qwen3.5-35b-a3b")
       // Secondary instances: served as internal name (e.g. "qwen3.5-35b-a3b__gpu0")
@@ -655,23 +755,21 @@ export class UnifiedProxy {
 
     // Track inflight and proxy
     group.startRequest(targetGpu);
+    let counted = true;
+    const endRequest = () => {
+      if (!counted) return;
+      counted = false;
+      group.endRequest(targetGpu);
+    };
+    req.signal.addEventListener("abort", endRequest);
+
     try {
       const response = await this.proxyRequest(req, targetEntry, rawBody);
-      const contentType = response.headers.get("content-type") || "";
 
-      // For streaming responses, wrap the body to decrement inflight when stream ends
-      if (
-        response.body &&
-        (contentType.includes("text/event-stream") || contentType.includes("stream"))
-      ) {
-        const originalBody = response.body;
-        const trackingStream = new TransformStream({
-          flush: () => {
-            group.endRequest(targetGpu);
-          },
-        });
-        const pipedBody = originalBody.pipeThrough(trackingStream);
-        return new Response(pipedBody, {
+      // For streaming responses, wrap the body so the count drops when the
+      // stream ends — or when the client walks away mid-stream.
+      if (response.body && isStreamingResponse(response)) {
+        return new Response(trackStreamEnd(response.body, endRequest), {
           status: response.status,
           statusText: response.statusText,
           headers: response.headers,
@@ -679,10 +777,10 @@ export class UnifiedProxy {
       }
 
       // Non-streaming: already fully consumed, decrement now
-      group.endRequest(targetGpu);
+      endRequest();
       return response;
     } catch (err) {
-      group.endRequest(targetGpu);
+      endRequest();
       throw err;
     }
   }
@@ -699,7 +797,11 @@ export class UnifiedProxy {
   }
 
   /** Ensure a model is downloaded and its backend process is running */
-  private async ensureRunning(entry: ModelEntry): Promise<void> {
+  private ensureRunning(entry: ModelEntry): Promise<void> {
+    return this.withLifecycle(entry, () => this.ensureRunningLocked(entry));
+  }
+
+  private async ensureRunningLocked(entry: ModelEntry): Promise<void> {
     // Step 1: Download if needed (HF models only)
     if (!isLocalModel(entry.config.modelPath)) {
       if (entry.downloading) {
@@ -717,9 +819,13 @@ export class UnifiedProxy {
         entry.downloading = true;
         entry.downloadError = null;
         try {
-          await downloadModel(entry.config.modelPath, (line) => {
-            console.log(`[${entry.config.name}] ${line}`);
-          });
+          await downloadModel(
+            entry.config.modelPath,
+            (line) => {
+              console.log(`[${entry.config.name}] ${line}`);
+            },
+            entry.config.modelFile
+          );
         } catch (err) {
           entry.downloadError = String(err);
           entry.downloading = false;
@@ -734,11 +840,7 @@ export class UnifiedProxy {
       const owner = makeGpuOwner(entry);
       const isSleeping = entry.process.status === "sleeping";
 
-      if (this.gpuLock.isRecentlyEvicted(entry.config.name)) {
-        console.warn(`[${entry.config.name}] Recently evicted, cooling down to prevent thrash`);
-      }
-
-      const preVRAM = isSleeping ? 0 : await this.gpuLock.snapshotVRAM(owner);
+      this.gpuLock.assertNotCoolingDown(owner);
       await this.gpuLock.acquire(owner);
 
       if (isSleeping) {
@@ -749,6 +851,10 @@ export class UnifiedProxy {
           : `GPU ${entry.config.gpu}`;
         console.log(`[${entry.config.name}] Cold start — launching ${entry.config.backend || "vllm"} on ${gpuStr}...`);
       }
+
+      // Snapshot after acquire: any eviction has already released its VRAM,
+      // so the post-start delta is this model's alone.
+      const preVRAM = isSleeping ? 0 : await this.gpuLock.snapshotVRAM(owner);
       await entry.process.start();
 
       if (!isSleeping) {
@@ -757,6 +863,7 @@ export class UnifiedProxy {
     }
 
     entry.process.touchActivity();
+    this.gpuLock.touchActivity(makeGpuOwner(entry));
     this.resetIdleTimer(entry);
   }
 
@@ -769,34 +876,77 @@ export class UnifiedProxy {
     const url = new URL(req.url);
     const targetUrl = `${entry.process.getInternalUrl()}${url.pathname}${url.search}`;
 
-    const headers = new Headers(req.headers);
-    headers.delete("host");
-
     const proxyReq: RequestInit = {
       method: req.method,
-      headers,
+      headers: stripHeaders(req.headers, STRIPPED_REQUEST_HEADERS),
+      // Client aborts have to reach the backend, otherwise it keeps decoding
+      // tokens for a response nobody will read.
+      signal: req.signal,
     };
 
     if (rawBody) {
       proxyReq.body = rawBody;
     }
 
-    const response = await fetch(targetUrl, proxyReq);
-    const contentType = response.headers.get("content-type") || "";
+    entry.inflight++;
+    let counted = true;
+    const done = () => {
+      if (!counted) return;
+      counted = false;
+      entry.inflight = Math.max(0, entry.inflight - 1);
+      entry.process.touchActivity();
+      this.gpuLock.touchActivity(makeGpuOwner(entry));
+      this.resetIdleTimer(entry);
+    };
+    // A client that hangs up mid-stream never reaches the stream's flush.
+    req.signal.addEventListener("abort", done);
 
-    if (contentType.includes("text/event-stream") || contentType.includes("stream")) {
-      return new Response(response.body, {
+    let response: Response;
+    try {
+      response = await fetch(targetUrl, proxyReq);
+    } catch (err) {
+      done();
+      if (req.signal.aborted) {
+        return Response.json({ error: "Client aborted the request" }, { status: 499 });
+      }
+      console.error(`[${entry.config.name}] Upstream request failed:`, err);
+      return Response.json(
+        {
+          error: "Backend request failed",
+          model: entry.config.name,
+          details: err instanceof Error ? err.message : String(err),
+        },
+        { status: 502 }
+      );
+    }
+
+    const headers = stripHeaders(response.headers, STRIPPED_RESPONSE_HEADERS);
+
+    if (response.body && isStreamingResponse(response)) {
+      // The idle timer must not fire mid-stream, so activity is touched when
+      // the stream finishes or the client cancels — not when it started.
+      return new Response(trackStreamEnd(response.body, done), {
         status: response.status,
         statusText: response.statusText,
-        headers: response.headers,
+        headers,
       });
     }
 
-    return new Response(await response.arrayBuffer(), {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers,
-    });
+    try {
+      const buffer = await response.arrayBuffer();
+      return new Response(buffer, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+    } catch (err) {
+      if (req.signal.aborted) {
+        return Response.json({ error: "Client aborted the request" }, { status: 499 });
+      }
+      throw err;
+    } finally {
+      done();
+    }
   }
 
   /** OpenAI /v1/models response listing all configured models + balance modifiers */
@@ -882,6 +1032,7 @@ export class UnifiedProxy {
         modelPath: config.modelPath,
         status: entry.process.status,
         lastActivity: entry.process.lastActivity,
+        inflight: entry.inflight,
         downloading: entry.downloading,
         downloadError: entry.downloadError,
         aliases: config.aliases || [],
@@ -906,6 +1057,104 @@ export class UnifiedProxy {
     return statuses;
   }
 
+  // ─── Management API ───────────────────────────────────────
+
+  /**
+   * The whole management surface. Mounted twice: under /manager/* on the proxy
+   * port, and at the root of the management port. Same handler, same shapes.
+   */
+  async handleManagement(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    const path = url.pathname.replace(/^\/manager/, "") || "/";
+    const isPost = req.method === "POST";
+
+    if (path === "/status" && !isPost) {
+      return Response.json({
+        models: this.getModelsStatus(),
+        gpus: await this.gpuLock.status(),
+        balanceGroups: this.getBalanceGroupsStatus(),
+      });
+    }
+
+    if (path === "/stop-all" && isPost) {
+      for (const entry of this.getManagedEntries()) {
+        await this.stopEntry(entry);
+      }
+      return Response.json({ status: "all stopped" });
+    }
+
+    const match = path.match(/^\/(status|start|stop|restart|reload-config)\/(.+)$/);
+    if (match) {
+      const [, action, encodedName] = match;
+      const modelName = decodeURIComponent(encodedName);
+      const entry = this.getEntry(modelName);
+      if (!entry) {
+        return Response.json({ error: `Unknown model: ${modelName}` }, { status: 404 });
+      }
+      const name = entry.config.name;
+
+      if (action === "status") return Response.json(entry.process.getState());
+      if (!isPost) return Response.json({ error: `${action} requires POST` }, { status: 405 });
+
+      if (action === "start") {
+        try {
+          await this.startModel(entry);
+          return Response.json({ status: "running", model: name });
+        } catch (err) {
+          if (err instanceof EvictionCooldownError) return this.startFailureResponse(err);
+          return Response.json({ error: String(err) }, { status: 500 });
+        }
+      }
+
+      if (action === "stop") {
+        await this.stopModel(entry);
+        return Response.json({ status: "stopped", model: name });
+      }
+
+      if (action === "reload-config") {
+        const newConfig = await this.reloadModelConfig(name);
+        if (!newConfig) {
+          return Response.json(
+            { error: `Model ${name} not found in config file` },
+            { status: 404 }
+          );
+        }
+        return Response.json({ status: "reloaded", model: name, config: newConfig });
+      }
+
+      let overrides: Record<string, string>;
+      try {
+        overrides = await parseRestartOverrides(req, url);
+      } catch (err) {
+        return Response.json({ error: (err as Error).message }, { status: 400 });
+      }
+      const result = await this.restartModel(
+        name,
+        Object.keys(overrides).length > 0 ? overrides : undefined
+      );
+      return Response.json(result, { status: result.status === "error" ? 500 : 200 });
+    }
+
+    return Response.json({
+      endpoints: {
+        "/status": "GET — Status of all models + GPUs",
+        "/status/<model>": "GET — Status of a single model",
+        "/stop-all": "POST — Stop all running models",
+        "/start/<model>": "POST — Start a specific model",
+        "/stop/<model>": "POST — Stop a specific model",
+        "/reload-config/<model>": "POST — Reload config from disk for a model",
+        "/restart/<model>":
+          "POST — Restart a model with fresh config. Query: ?context=N. " +
+          `Body: { overrides: { "-c": "N" } }. Allowed flags: ${RESTART_OVERRIDE_FLAGS.join(", ")}`,
+      },
+      models: this.getManagedEntries().map((e) => ({
+        name: e.config.name,
+        status: e.process.status,
+        backend: e.config.backend || "vllm",
+      })),
+    });
+  }
+
   // ─── Idle timer management ────────────────────────────────
 
   private resetIdleTimer(entry: ModelEntry) {
@@ -914,6 +1163,12 @@ export class UnifiedProxy {
 
     const timer = setTimeout(async () => {
       try {
+        // A long generation is activity, even though nothing has been touched
+        // since the request started.
+        if (entry.inflight > 0) {
+          this.resetIdleTimer(entry);
+          return;
+        }
         const idleTime = Date.now() - entry.process.lastActivity;
         if (idleTime >= entry.config.idleTimeout && entry.process.status === "running") {
           const sleepDelay = entry.config.sleepDelay ?? 0;
@@ -936,11 +1191,8 @@ export class UnifiedProxy {
       } catch (err) {
         console.error(`[${entry.config.name}] Error during idle unload:`, err);
         try {
-          await entry.process.stop();
+          await this.stopEntry(entry);
         } catch { /* already logged */ }
-        try {
-          this.gpuLock.notifyStopped(makeGpuOwner(entry));
-        } catch { /* best effort */ }
       }
     }, entry.config.idleTimeout);
 
@@ -955,12 +1207,16 @@ export class UnifiedProxy {
     }
   }
 
-  /** Periodic sweep to catch any models that missed their idle timer */
+  /**
+   * Periodic sweep to catch any models that missed their idle timer.
+   * Re-armed after each pass so a slow sweep can't overlap itself.
+   */
   startIdleSweep(intervalMs = 60_000) {
-    if (this.idleSweepTimer) clearInterval(this.idleSweepTimer);
-    this.idleSweepTimer = setInterval(async () => {
-      for (const entry of this.getEntries()) {
-        if (entry.process.status !== "running") continue;
+    if (this.idleSweepTimer) clearTimeout(this.idleSweepTimer);
+
+    const sweep = async () => {
+      for (const entry of this.getManagedEntries()) {
+        if (entry.process.status !== "running" || entry.inflight > 0) continue;
         const idleTime = Date.now() - entry.process.lastActivity;
         if (idleTime >= entry.config.idleTimeout) {
           console.log(
@@ -974,7 +1230,53 @@ export class UnifiedProxy {
           }
         }
       }
-    }, intervalMs);
+      this.idleSweepTimer = setTimeout(sweep, intervalMs);
+    };
+
+    this.idleSweepTimer = setTimeout(sweep, intervalMs);
+  }
+
+  /**
+   * Periodically probe every running backend. A backend that fails three
+   * probes in a row is gone as far as clients are concerned (OOM-killed,
+   * wedged, crashed): force it stopped so the GPU reservation is released and
+   * the next request cold-starts it cleanly.
+   */
+  startHealthChecks(intervalMs: number) {
+    if (this.healthTimer) clearTimeout(this.healthTimer);
+    if (!intervalMs || intervalMs <= 0) return;
+
+    const check = async () => {
+      for (const entry of this.getManagedEntries()) {
+        const name = entry.config.name;
+        if (entry.process.status !== "running") {
+          this.healthFailures.delete(name);
+          continue;
+        }
+
+        if (await entry.process.healthCheck()) {
+          this.healthFailures.delete(name);
+          continue;
+        }
+
+        const failures = (this.healthFailures.get(name) ?? 0) + 1;
+        this.healthFailures.set(name, failures);
+        console.warn(`[health] ${name} failed health check (${failures}/${HEALTH_FAILURES_BEFORE_STOP})`);
+
+        if (failures >= HEALTH_FAILURES_BEFORE_STOP) {
+          console.error(`[health] ${name} is unhealthy — stopping it`);
+          this.healthFailures.delete(name);
+          try {
+            await this.stopEntry(entry);
+          } catch (err) {
+            console.error(`[health] Failed to stop ${name}:`, err);
+          }
+        }
+      }
+      this.healthTimer = setTimeout(check, intervalMs);
+    };
+
+    this.healthTimer = setTimeout(check, intervalMs);
   }
 
   /**
@@ -988,6 +1290,11 @@ export class UnifiedProxy {
       console.warn(`[reload] Model ${modelName} not found in proxy`);
       return null;
     }
+    return this.withLifecycle(entry, () => this.reloadModelConfigLocked(entry));
+  }
+
+  private async reloadModelConfigLocked(entry: ModelEntry): Promise<ModelConfig | null> {
+    const modelName = entry.config.name;
 
     // Re-read from disk
     const newConfig = reloadModelConfigFromDisk(modelName);
@@ -996,12 +1303,11 @@ export class UnifiedProxy {
       return null;
     }
 
-    // Stop if running
-    if (entry.process.status === "running" || entry.process.status === "starting") {
+    // Stop if running — stopEntry also covers "sleeping", which updateConfig
+    // would otherwise reject.
+    if (entry.process.status !== "stopped") {
       console.log(`[reload] Stopping ${modelName} before config update...`);
-      await entry.process.stop();
-      this.clearIdleTimer(modelName);
-      this.gpuLock.notifyStopped(makeGpuOwner(entry));
+      await this.stopEntryLocked(entry);
     }
 
     // Update in-memory config
@@ -1028,10 +1334,8 @@ export class UnifiedProxy {
         }
 
         // Stop balance instance if running
-        if (balanceEntry.process.status === "running" || balanceEntry.process.status === "starting") {
-          await balanceEntry.process.stop();
-          this.clearIdleTimer(gpuConfig.name);
-          this.gpuLock.notifyStopped(makeGpuOwner(balanceEntry));
+        if (balanceEntry.process.status !== "stopped") {
+          await this.stopEntry(balanceEntry);
         }
 
         balanceEntry.config = gpuConfig;
@@ -1056,17 +1360,27 @@ export class UnifiedProxy {
     if (!entry) {
       return { status: "error", error: `Unknown model: ${modelName}` };
     }
+    // Stop and start are one transition: a lazy start slipping between them
+    // would spawn a second backend onto the port this one is about to take.
+    return this.withLifecycle(entry, () => this.restartModelLocked(entry, argOverrides));
+  }
+
+  private async restartModelLocked(
+    entry: ModelEntry,
+    argOverrides?: Record<string, string>
+  ): Promise<{ status: string; config?: ModelConfig; error?: string }> {
+    const modelName = entry.config.name;
 
     try {
       // Step 1: Reload config (this also stops the process)
-      const newConfig = await this.reloadModelConfig(modelName);
+      const newConfig = await this.reloadModelConfigLocked(entry);
       if (!newConfig) {
         return { status: "error", error: `Model ${modelName} not found in config file` };
       }
 
       // Step 2: Apply runtime arg overrides if provided
-      if (argOverrides && Object.keys(argOverrides).length > 0 && newConfig.extraArgs) {
-        const args = [...newConfig.extraArgs];
+      if (argOverrides && Object.keys(argOverrides).length > 0) {
+        const args = [...(newConfig.extraArgs ?? [])];
         for (const [flag, value] of Object.entries(argOverrides)) {
           // Find the flag in extraArgs and replace the value that follows it
           const idx = args.indexOf(flag);
@@ -1087,7 +1401,7 @@ export class UnifiedProxy {
 
       // Step 3: Start with new config
       console.log(`[restart] Starting ${modelName} with updated config...`);
-      await this.ensureRunning(entry);
+      await this.ensureRunningLocked(entry);
 
       return { status: "running", config: newConfig };
     } catch (err) {
@@ -1098,8 +1412,12 @@ export class UnifiedProxy {
   /** Stop all models and the server */
   async stop() {
     if (this.idleSweepTimer) {
-      clearInterval(this.idleSweepTimer);
+      clearTimeout(this.idleSweepTimer);
       this.idleSweepTimer = null;
+    }
+    if (this.healthTimer) {
+      clearTimeout(this.healthTimer);
+      this.healthTimer = null;
     }
 
     for (const entry of this.getManagedEntries()) {
@@ -1109,21 +1427,11 @@ export class UnifiedProxy {
     this.server?.stop();
   }
 
-  /** Get entries for the management API */
-  getEntries(): ModelEntry[] {
-    const seen = new Set<string>();
-    const entries: ModelEntry[] = [];
-    for (const [, entry] of this.models) {
-      if (!seen.has(entry.config.name)) {
-        seen.add(entry.config.name);
-        entries.push(entry);
-      }
+  /** Best-effort synchronous kill of every backend, for process exit. */
+  killAllNow(): void {
+    for (const entry of this.getManagedEntries()) {
+      entry.process.killNow();
     }
-    return entries;
   }
 
-  /** Get balance groups for external inspection */
-  getBalanceGroups(): Map<string, BalancedModelGroup> {
-    return this.balanceGroups;
-  }
 }

@@ -6,6 +6,7 @@
  * model(s) until there's enough room.
  */
 
+import { readFileSync, writeFileSync } from "fs";
 import {
   estimateVRAM,
   getGpuInfo,
@@ -13,6 +14,7 @@ import {
   getGpuMemoryUtil,
   type ModelSizeEstimate,
 } from "./model-size";
+import { MODELS_DIR } from "./download";
 import type { ModelConfig } from "./config";
 
 export interface GpuOwner {
@@ -37,24 +39,80 @@ interface EvictionRecord {
   evictedAt: number;
 }
 
-const VRAM_SAFETY_MARGIN = 0.95;
+/** Left free on every card, so the driver and the desktop aren't squeezed out. */
+const VRAM_HEADROOM_GB = 1.0;
 const ANTI_THRASH_COOLDOWN_MS = 30_000;
 const VRAM_SNAPSHOT_SETTLE_MS = 3_000;
+
+/** Thrown when a just-evicted model is asked to reload into contended VRAM. */
+export class EvictionCooldownError extends Error {
+  readonly retryAfterSeconds: number;
+
+  constructor(modelName: string, retryAfterSeconds: number) {
+    super(
+      `${modelName} was evicted less than ${ANTI_THRASH_COOLDOWN_MS / 1000}s ago and the GPU is ` +
+        `still contended — retry in ${retryAfterSeconds}s`
+    );
+    this.name = "EvictionCooldownError";
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+// ─── Observed VRAM persistence ──────────────────────────────────
+
+/**
+ * Measured VRAM per model, kept across restarts. Real numbers beat estimates,
+ * and a router restart shouldn't throw away what we already learned.
+ */
+const OBSERVED_VRAM_PATH = `${MODELS_DIR}/.locallm-router-observed.json`;
+
+function loadObservedVRAM(): Map<string, number> {
+  try {
+    const raw = JSON.parse(readFileSync(OBSERVED_VRAM_PATH, "utf-8")) as Record<string, number>;
+    const entries = Object.entries(raw).filter(([, gb]) => typeof gb === "number" && gb > 0);
+    if (entries.length > 0) {
+      console.log(`[gpu-lock] Loaded observed VRAM for ${entries.length} model(s) from ${OBSERVED_VRAM_PATH}`);
+    }
+    return new Map(entries);
+  } catch {
+    return new Map();
+  }
+}
+
+const observedVRAM = loadObservedVRAM();
+
+function persistObservedVRAM(modelName: string, gb: number): void {
+  observedVRAM.set(modelName, Math.round(gb * 100) / 100);
+  try {
+    writeFileSync(OBSERVED_VRAM_PATH, JSON.stringify(Object.fromEntries(observedVRAM), null, 2));
+  } catch (err) {
+    console.warn(`[gpu-lock] Could not persist observed VRAM to ${OBSERVED_VRAM_PATH}:`, err);
+  }
+}
 
 class GpuScheduler {
   readonly gpu: number;
   private totalVRAM: number = 0;
+  private initialized = false;
+  private initPromise: Promise<void> | null = null;
   private loaded = new Map<string, LoadedModel>();
   private estimates = new Map<string, ModelSizeEstimate>();
   private recentEvictions: EvictionRecord[] = [];
   private lastReconcileTime = 0;
+  /** Serializes acquire() so two cold starts can't both claim the same VRAM. */
+  private queue: Promise<unknown> = Promise.resolve();
   private static readonly RECONCILE_INTERVAL_MS = 5000;
 
   constructor(gpu: number) {
     this.gpu = gpu;
   }
 
-  async initialize(): Promise<void> {
+  initialize(): Promise<void> {
+    if (!this.initPromise) this.initPromise = this.readTotalVRAM();
+    return this.initPromise;
+  }
+
+  private async readTotalVRAM(): Promise<void> {
     const gpus = await getGpuInfo();
     const gpuInfo = gpus.find((g) => g.index === this.gpu);
     if (gpuInfo) {
@@ -64,6 +122,11 @@ class GpuScheduler {
       this.totalVRAM = 24;
       console.log(`[gpu-lock] GPU ${this.gpu}: Unknown (assuming 24GB)`);
     }
+    this.initialized = true;
+  }
+
+  get isInitialized(): boolean {
+    return this.initialized;
   }
 
   registerModel(owner: GpuOwner): void {
@@ -82,6 +145,7 @@ class GpuScheduler {
           }
         : estimate;
     this.estimates.set(owner.name, perGpuEstimate);
+    const observed = observedVRAM.get(owner.name);
     if (numGpus > 1) {
       console.log(
         `[gpu-lock] GPU ${this.gpu}: ${owner.name} -> ${formatEstimate(estimate)} (${estimate.totalVRAM.toFixed(1)}GB total / ${numGpus} GPUs = ${perGpuEstimate.totalVRAM.toFixed(1)}GB here)`
@@ -89,10 +153,40 @@ class GpuScheduler {
     } else {
       console.log(`[gpu-lock] GPU ${this.gpu}: ${owner.name} -> ${formatEstimate(estimate)}`);
     }
+    if (observed !== undefined) {
+      console.log(`[gpu-lock] GPU ${this.gpu}: ${owner.name} previously observed at ${observed.toFixed(1)}GB`);
+    }
+  }
+
+  /**
+   * vLLM preallocates totalVRAM × its own --gpu-memory-utilization on every
+   * card it runs on, so that is a floor on what it will take here. The flag
+   * caps that model's own appetite; it says nothing about the rest of the card.
+   */
+  private preallocFloor(config: ModelConfig): number {
+    if ((config.backend ?? "vllm") !== "vllm") return 0;
+    return this.totalVRAM * getGpuMemoryUtil(config.extraArgs);
+  }
+
+  /**
+   * Per-card footprint. A measurement beats a prediction, but never falls below
+   * what vLLM is going to preallocate regardless: a snapshot taken while the
+   * previous tenant was still handing memory back reads low, and admitting on
+   * that number oversubscribes the card.
+   */
+  private footprint(config: ModelConfig, estimateGB: number, observedGB: number | null): number {
+    return Math.max(observedGB ?? estimateGB, this.preallocFloor(config));
   }
 
   private getModelVRAM(model: LoadedModel): number {
-    return model.observedVRAM ?? model.estimate.totalVRAM;
+    return this.footprint(model.owner.config, model.estimate.totalVRAM, model.observedVRAM);
+  }
+
+  /** What this model is expected to take here — measured if we've seen it run. */
+  private expectedVRAM(owner: GpuOwner): number {
+    const estimate = this.estimates.get(owner.name);
+    if (!estimate) throw new Error(`Model ${owner.name} not registered`);
+    return this.footprint(owner.config, estimate.totalVRAM, observedVRAM.get(owner.name) ?? null);
   }
 
   private getEstimatedVRAM(): number {
@@ -130,14 +224,9 @@ class GpuScheduler {
     }
   }
 
+  /** Room left on the card for a model that isn't resident yet. */
   private getAvailableVRAM(): number {
-    return this.totalVRAM * VRAM_SAFETY_MARGIN - this.getEstimatedVRAM();
-  }
-
-  canFit(owner: GpuOwner): boolean {
-    const estimate = this.estimates.get(owner.name);
-    if (!estimate) return false;
-    return estimate.totalVRAM <= this.totalVRAM;
+    return this.totalVRAM - VRAM_HEADROOM_GB - this.getEstimatedVRAM();
   }
 
   /** Snapshot current GPU memory usage (call before model start) */
@@ -156,6 +245,7 @@ class GpuScheduler {
     if (!model || delta < 0.5) return;
 
     model.observedVRAM = delta;
+    persistObservedVRAM(owner.name, delta);
     const estGB = model.estimate.totalVRAM;
     const drift = Math.abs(delta - estGB);
     if (drift > 1) {
@@ -165,37 +255,82 @@ class GpuScheduler {
     }
   }
 
-  /** Check if a model was recently evicted (anti-thrash) */
-  isRecentlyEvicted(modelName: string): boolean {
+  /**
+   * Adopt a per-card measurement taken on another card of the same model —
+   * tensor-parallel residency is recorded on every GPU the model occupies.
+   */
+  refreshObservedVRAM(owner: GpuOwner): void {
+    const model = this.loaded.get(owner.name);
+    const observed = observedVRAM.get(owner.name);
+    if (model && observed !== undefined) model.observedVRAM = observed;
+  }
+
+  /** Milliseconds left on a model's anti-thrash cooldown, 0 when clear. */
+  cooldownRemaining(modelName: string): number {
     const now = Date.now();
     this.recentEvictions = this.recentEvictions.filter(
       (e) => now - e.evictedAt < ANTI_THRASH_COOLDOWN_MS
     );
-    return this.recentEvictions.some((e) => e.modelName === modelName);
+    const record = this.recentEvictions.find((e) => e.modelName === modelName);
+    return record ? ANTI_THRASH_COOLDOWN_MS - (now - record.evictedAt) : 0;
+  }
+
+  /** True when this model can only be loaded by evicting something else. */
+  needsEviction(owner: GpuOwner): boolean {
+    if (this.loaded.has(owner.name)) return false;
+    return this.expectedVRAM(owner) > this.getAvailableVRAM();
   }
 
   private recordEviction(modelName: string): void {
     this.recentEvictions.push({ modelName, evictedAt: Date.now() });
   }
 
-  private getEvictionCandidates(neededVRAM: number): GpuOwner[] {
-    const candidates = [...this.loaded.values()].sort((a, b) => {
-      const pa = a.owner.config.priority ?? 0;
-      const pb = b.owner.config.priority ?? 0;
-      if (pa !== pb) return pa - pb;
-      return a.lastActivity - b.lastActivity;
-    });
-    const toEvict: GpuOwner[] = [];
+  private getEvictionCandidates(neededVRAM: number, excludeName: string): LoadedModel[] {
+    const candidates = [...this.loaded.values()]
+      .filter((m) => m.owner.name !== excludeName)
+      .sort((a, b) => {
+        const pa = a.owner.config.priority ?? 0;
+        const pb = b.owner.config.priority ?? 0;
+        if (pa !== pb) return pa - pb;
+        return a.lastActivity - b.lastActivity;
+      });
+    const toEvict: LoadedModel[] = [];
     let freedVRAM = 0;
     for (const model of candidates) {
       if (freedVRAM >= neededVRAM) break;
-      toEvict.push(model.owner);
+      toEvict.push(model);
       freedVRAM += this.getModelVRAM(model);
     }
     return toEvict;
   }
 
-  async acquire(owner: GpuOwner): Promise<void> {
+  /** Fail loudly with the numbers, so "it didn't fit" is never a mystery. */
+  private cannotFitError(owner: GpuOwner, needVRAM: number): Error {
+    const residents = [...this.loaded.values()]
+      .filter((m) => m.owner.name !== owner.name)
+      .map((m) => `${m.owner.name} ${this.getModelVRAM(m).toFixed(1)}GB`);
+    return new Error(
+      `Cannot fit ${owner.name} (${needVRAM.toFixed(1)}GB) on GPU ${this.gpu}: ` +
+        `${this.totalVRAM.toFixed(1)}GB total, ${VRAM_HEADROOM_GB.toFixed(1)}GB headroom, resident: ` +
+        (residents.length > 0 ? residents.join(", ") : "none")
+    );
+  }
+
+  /**
+   * Reserve VRAM for a model, evicting others if needed. Serialized: a second
+   * caller waits rather than racing the first one's eviction.
+   */
+  acquire(owner: GpuOwner): Promise<void> {
+    const run = this.queue.then(
+      () => this.acquireLocked(owner),
+      () => this.acquireLocked(owner)
+    );
+    this.queue = run.catch(() => {});
+    return run;
+  }
+
+  private async acquireLocked(owner: GpuOwner): Promise<void> {
+    await this.initialize();
     await this.reconcileWithGpu();
 
     if (this.loaded.has(owner.name)) {
@@ -205,41 +340,59 @@ class GpuScheduler {
 
     const estimate = this.estimates.get(owner.name);
     if (!estimate) throw new Error(`Model ${owner.name} not registered`);
+    const needVRAM = this.expectedVRAM(owner);
+    const available = this.getAvailableVRAM();
 
-    const gpuUtil = getGpuMemoryUtil(owner.config.extraArgs);
-    const hasOtherModels = this.loaded.size > 0;
-    const margin = hasOtherModels ? VRAM_SAFETY_MARGIN : 1.0;
-    const usableVRAM = this.totalVRAM * gpuUtil * margin;
-    const available = usableVRAM - this.getEstimatedVRAM();
+    // Coexistence first: only what the resident models actually hold is off
+    // limits, and eviction is the fallback when that genuinely isn't enough.
+    const toEvict =
+      needVRAM <= available ? [] : this.getEvictionCandidates(needVRAM - available, owner.name);
+    const freeable = toEvict.reduce((sum, m) => sum + this.getModelVRAM(m), 0);
+    if (needVRAM > available + freeable) {
+      throw this.cannotFitError(owner, needVRAM);
+    }
 
-    if (estimate.totalVRAM <= available) {
-      console.log(`[gpu-lock] GPU ${this.gpu}: ${owner.name} fits (need ${estimate.totalVRAM.toFixed(1)}GB, have ${available.toFixed(1)}GB)`);
-      this.loaded.set(owner.name, { owner, estimate, observedVRAM: null, loadedAt: Date.now(), lastActivity: Date.now() });
+    // Reserve before evicting: the slot is ours for the whole (slow) eviction,
+    // and the victims can't pick it back up on their way out.
+    this.reserve(owner, estimate);
+
+    if (toEvict.length === 0) {
+      console.log(
+        `[gpu-lock] GPU ${this.gpu}: ${owner.name} fits (need ${needVRAM.toFixed(1)}GB, have ${available.toFixed(1)}GB)`
+      );
       return;
     }
 
-    const needsFullGpu = estimate.totalVRAM > this.totalVRAM * gpuUtil;
-    const toEvict = needsFullGpu
-      ? [...this.loaded.values()].map((m) => m.owner)
-      : this.getEvictionCandidates(estimate.totalVRAM - available);
-
-    if (toEvict.length === 0 && estimate.totalVRAM > this.totalVRAM) {
-      throw new Error(`Cannot fit ${owner.name} on GPU ${this.gpu}`);
-    }
-
-    console.log(`[gpu-lock] GPU ${this.gpu}: evicting ${toEvict.map((o) => o.name).join(", ")} for ${owner.name}`);
+    console.log(
+      `[gpu-lock] GPU ${this.gpu}: evicting ${toEvict.map((m) => m.owner.name).join(", ")} for ${owner.name}`
+    );
 
     for (const victim of toEvict) {
       try {
-        await victim.stopProcess();
-        this.recordEviction(victim.name);
-        this.loaded.delete(victim.name);
+        await victim.owner.stopProcess();
+        this.recordEviction(victim.owner.name);
+        this.loaded.delete(victim.owner.name);
       } catch (err) {
-        console.error(`[gpu-lock] GPU ${this.gpu}: failed to evict ${victim.name}:`, err);
+        console.error(`[gpu-lock] GPU ${this.gpu}: failed to evict ${victim.owner.name}:`, err);
       }
     }
 
-    this.loaded.set(owner.name, { owner, estimate, observedVRAM: null, loadedAt: Date.now(), lastActivity: Date.now() });
+    // An eviction that failed leaves the incoming model without the room it was
+    // promised; starting it anyway just OOMs the card.
+    if (this.getAvailableVRAM() < 0) {
+      this.loaded.delete(owner.name);
+      throw this.cannotFitError(owner, needVRAM);
+    }
+  }
+
+  private reserve(owner: GpuOwner, estimate: ModelSizeEstimate): void {
+    this.loaded.set(owner.name, {
+      owner,
+      estimate,
+      observedVRAM: observedVRAM.get(owner.name) ?? null,
+      loadedAt: Date.now(),
+      lastActivity: Date.now(),
+    });
   }
 
   touchActivity(owner: GpuOwner): void {
@@ -247,15 +400,9 @@ class GpuScheduler {
     if (model) model.lastActivity = Date.now();
   }
 
-  release(owner: GpuOwner): void {
-    this.loaded.delete(owner.name);
-  }
-
   notifyStopped(owner: GpuOwner): void {
     this.loaded.delete(owner.name);
   }
-
-  get currentModels(): string[] { return [...this.loaded.keys()]; }
 
   async getStatus() {
     await this.reconcileWithGpu();
@@ -277,39 +424,74 @@ class GpuScheduler {
 
 export class GpuLock {
   private schedulers = new Map<number, GpuScheduler>();
-  private initialized = false;
+
+  /** Number of GPUs the driver reported at boot. */
+  get gpuCount(): number {
+    return this.schedulers.size;
+  }
 
   async initialize(): Promise<void> {
-    if (this.initialized) return;
     const gpus = await getGpuInfo();
     console.log(`[gpu-lock] Detected ${gpus.length} GPU(s)`);
     for (const gpu of gpus) {
+      if (this.schedulers.has(gpu.index)) continue;
       const scheduler = new GpuScheduler(gpu.index);
       await scheduler.initialize();
       this.schedulers.set(gpu.index, scheduler);
     }
-    this.initialized = true;
   }
 
   private gpuIndices(owner: GpuOwner): number[] {
     return owner.gpus && owner.gpus.length > 0 ? owner.gpus : [owner.gpu];
   }
 
+  /**
+   * A scheduler for a GPU the driver never reported still gets created — the
+   * model is configured for it — but it only learns its size on first acquire.
+   */
+  private schedulerFor(gpuIdx: number): GpuScheduler {
+    let scheduler = this.schedulers.get(gpuIdx);
+    if (!scheduler) {
+      scheduler = new GpuScheduler(gpuIdx);
+      this.schedulers.set(gpuIdx, scheduler);
+    }
+    return scheduler;
+  }
+
   register(owner: GpuOwner): void {
     for (const gpuIdx of this.gpuIndices(owner)) {
-      if (!this.schedulers.has(gpuIdx)) {
-        const scheduler = new GpuScheduler(gpuIdx);
-        this.schedulers.set(gpuIdx, scheduler);
-      }
-      this.schedulers.get(gpuIdx)!.registerModel(owner);
+      this.schedulerFor(gpuIdx).registerModel(owner);
     }
   }
 
   async acquire(owner: GpuOwner): Promise<void> {
+    const acquired: GpuScheduler[] = [];
+    for (const gpuIdx of this.gpuIndices(owner)) {
+      const scheduler = this.schedulerFor(gpuIdx);
+      try {
+        await scheduler.acquire(owner);
+        acquired.push(scheduler);
+      } catch (err) {
+        // Partial multi-GPU acquisition helps nobody: hand back what we took.
+        for (const held of acquired) held.notifyStopped(owner);
+        throw err;
+      }
+    }
+  }
+
+  /**
+   * Refuse to reload a model that was evicted moments ago into a GPU that is
+   * still full — that's the thrash loop, and the client is better served by a
+   * 503 telling it when to come back.
+   */
+  assertNotCoolingDown(owner: GpuOwner): void {
     for (const gpuIdx of this.gpuIndices(owner)) {
       const scheduler = this.schedulers.get(gpuIdx);
-      if (!scheduler) throw new Error(`GPU ${gpuIdx} not registered`);
-      await scheduler.acquire(owner);
+      if (!scheduler || !scheduler.isInitialized) continue;
+      const remainingMs = scheduler.cooldownRemaining(owner.name);
+      if (remainingMs > 0 && scheduler.needsEviction(owner)) {
+        throw new EvictionCooldownError(owner.name, Math.ceil(remainingMs / 1000));
+      }
     }
   }
 
@@ -322,17 +504,20 @@ export class GpuLock {
 
   /** Record observed VRAM after a model finishes loading */
   async recordObservedVRAM(owner: GpuOwner, preSnapshotGB: number): Promise<void> {
-    const primaryGpu = this.gpuIndices(owner)[0];
+    const [primaryGpu, ...otherGpus] = this.gpuIndices(owner);
     const scheduler = this.schedulers.get(primaryGpu);
-    if (scheduler) await scheduler.recordObservedVRAM(owner, preSnapshotGB);
+    if (!scheduler) return;
+    await scheduler.recordObservedVRAM(owner, preSnapshotGB);
+    // The measurement is the model's share of one card, which is what a
+    // tensor-parallel model holds on each of the others too.
+    for (const gpuIdx of otherGpus) this.schedulers.get(gpuIdx)?.refreshObservedVRAM(owner);
   }
 
-  /** Check if a model was recently evicted (anti-thrash cooldown) */
-  isRecentlyEvicted(modelName: string): boolean {
-    for (const scheduler of this.schedulers.values()) {
-      if (scheduler.isRecentlyEvicted(modelName)) return true;
+  /** Mark a model as used, so eviction order is real LRU */
+  touchActivity(owner: GpuOwner): void {
+    for (const gpuIdx of this.gpuIndices(owner)) {
+      this.schedulers.get(gpuIdx)?.touchActivity(owner);
     }
-    return false;
   }
 
   notifyStopped(owner: GpuOwner): void {
