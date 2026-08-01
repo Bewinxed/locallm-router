@@ -1,12 +1,16 @@
 /**
  * Model Size Estimation for GPU Memory Planning
  *
- * Estimates VRAM usage based on:
- * - Parameter count (from config or inferred from model name)
- * - Quantization type (fp16, fp8, int8, int4, etc.)
- * - Context length (affects KV cache size)
- * - GPU memory utilization setting
+ * Estimates are produced in trust order (see resolveEstimate): the GGUF header
+ * — read from disk, or over HTTP range requests for a model that has not been
+ * downloaded yet — then the configured vramGB, then a parameter-count
+ * heuristic. Sizes are GiB throughout, matching what nvidia-smi reports.
  */
+
+import { statSync } from "fs";
+import { gguf, type GGUFParseOutput } from "@huggingface/gguf";
+import type { ModelConfig } from "./config";
+import { hfFileUrl, isLocalModel, resolveModelPath } from "./download";
 
 export interface ModelSizeEstimate {
   /** Estimated parameter count in billions */
@@ -17,9 +21,11 @@ export interface ModelSizeEstimate {
   kvCacheGB: number;
   /** Total estimated VRAM in GB */
   totalVRAM: number;
-  /** Confidence: 'exact' if params specified, 'inferred' if from name */
-  confidence: "exact" | "inferred" | "unknown";
+  /** Where the number came from, best first. */
+  confidence: "gguf-local" | "gguf-remote" | "manual" | "exact" | "inferred" | "unknown";
 }
+
+const GIB = 1024 ** 3;
 
 /** Bytes per parameter for different quantization types */
 const BYTES_PER_PARAM: Record<string, number> = {
@@ -55,8 +61,70 @@ const KV_CACHE_FACTOR: Record<string, number> = {
 /** Fixed CUDA/framework overhead in GB */
 const CUDA_OVERHEAD_GB = 1.5;
 
-/** Activation memory overhead multiplier */
-const ACTIVATION_OVERHEAD = 1.15;
+/**
+ * Compute buffers. Near-constant per backend, then a slice that follows the
+ * context window — unlike the weights, which they don't scale with at all.
+ */
+const ACTIVATION_BASE_GB = 0.5;
+const ACTIVATION_PER_1K_CTX_GB = 0.02;
+
+/**
+ * Bytes per element for the quantizations llama.cpp accepts in
+ * --cache-type-k/v: ggml's type_size / block_size, scales and all. A quantized
+ * KV cache is never as small as its name suggests — q8_0 stores a 16-bit scale
+ * per 32-element block, so it costs 1.0625 bytes per element, not 1.
+ */
+const KV_CACHE_TYPE_BYTES: Record<string, number> = {
+  f32: 4,
+  f16: 2,
+  bf16: 2,
+  q8_0: 1.0625,
+  q5_1: 0.75,
+  q5_0: 0.6875,
+  q4_1: 0.625,
+  q4_0: 0.5625,
+  iq4_nl: 0.5625,
+};
+
+/**
+ * Bytes per element for every ggml tensor type, by its GGUF type id:
+ * type_size / block_size from ggml-common.h. K-quants pack 256 elements per
+ * block, the rest 32.
+ */
+const GGML_TYPE_BYTES: Record<number, number> = {
+  0: 4, // F32
+  1: 2, // F16
+  2: 0.5625, // Q4_0
+  3: 0.625, // Q4_1
+  6: 0.6875, // Q5_0
+  7: 0.75, // Q5_1
+  8: 1.0625, // Q8_0
+  9: 1.125, // Q8_1
+  10: 0.328125, // Q2_K
+  11: 0.4296875, // Q3_K
+  12: 0.5625, // Q4_K
+  13: 0.6875, // Q5_K
+  14: 0.8203125, // Q6_K
+  15: 1.140625, // Q8_K
+  16: 0.2578125, // IQ2_XXS
+  17: 0.2890625, // IQ2_XS
+  18: 0.3828125, // IQ3_XXS
+  19: 0.1953125, // IQ1_S
+  20: 0.5625, // IQ4_NL
+  21: 0.4296875, // IQ3_S
+  22: 0.3203125, // IQ2_S
+  23: 0.53125, // IQ4_XS
+  24: 1, // I8
+  25: 2, // I16
+  26: 4, // I32
+  27: 8, // I64
+  28: 8, // F64
+  29: 0.21875, // IQ1_M
+  30: 2, // BF16
+  34: 0.2109375, // TQ1_0
+  35: 0.2578125, // TQ2_0
+  39: 0.53125, // MXFP4
+};
 
 /**
  * Infer parameter count from model path/name.
@@ -130,17 +198,51 @@ export function getQuantizationType(
   return (dtype || "bfloat16").toLowerCase();
 }
 
+/** Read the value that follows a flag in extraArgs. */
+export function argValue(extraArgs: string[] | undefined, ...flags: string[]): string | null {
+  if (!extraArgs) return null;
+  for (const flag of flags) {
+    const idx = extraArgs.indexOf(flag);
+    if (idx !== -1 && extraArgs[idx + 1]) return extraArgs[idx + 1];
+  }
+  return null;
+}
+
 /**
- * Get max model length from extraArgs.
+ * Get max model length from extraArgs. `--max-model-len` is vLLM/SGLang,
+ * `-c`/`--ctx-size` is llama.cpp.
  */
 export function getMaxModelLen(extraArgs: string[] | undefined): number {
-  if (extraArgs) {
-    const lenIdx = extraArgs.indexOf("--max-model-len");
-    if (lenIdx !== -1 && extraArgs[lenIdx + 1]) {
-      return parseInt(extraArgs[lenIdx + 1]);
-    }
+  const value = argValue(extraArgs, "--max-model-len", "-c", "--ctx-size");
+  const parsed = value ? parseInt(value) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 4096;
+}
+
+/** Average bytes per KV cache element, from llama.cpp's --cache-type-k/v. */
+function getKvCacheTypeBytes(extraArgs: string[] | undefined): number {
+  const k = argValue(extraArgs, "--cache-type-k", "-ctk");
+  const v = argValue(extraArgs, "--cache-type-v", "-ctv");
+  const bytes = (type: string | null) =>
+    (type && KV_CACHE_TYPE_BYTES[type.toLowerCase()]) || KV_CACHE_TYPE_BYTES.f16;
+  return (bytes(k) + bytes(v)) / 2;
+}
+
+/**
+ * Weights size for a GGUF model: the file on disk is the answer, no
+ * quantization guessing needed. Null when the file isn't downloaded yet.
+ */
+function ggufWeightsGB(config: { modelPath: string; modelFile?: string }): number | null {
+  try {
+    return statSync(resolveModelPath(config)).size / GIB;
+  } catch {
+    return null;
   }
-  return 4096; // Default
+}
+
+/** Positive integer value of a flag, or `fallback` when absent or unparseable. */
+function intArg(extraArgs: string[] | undefined, fallback: number, ...flags: string[]): number {
+  const parsed = parseInt(argValue(extraArgs, ...flags) ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 /**
@@ -176,6 +278,8 @@ function getKvCacheClass(paramsBillions: number): keyof typeof KV_CACHE_FACTOR {
  */
 export function estimateVRAM(config: {
   modelPath: string;
+  modelFile?: string;
+  backend?: string;
   parameterCount?: number;
   activatedParameterCount?: number;
   dtype?: string;
@@ -207,16 +311,19 @@ export function estimateVRAM(config: {
   const quantType = getQuantizationType(config.dtype, config.extraArgs);
   const bytesPerParam = BYTES_PER_PARAM[quantType] || BYTES_PER_PARAM.bfloat16;
 
-  // Calculate weights size (all params must fit in VRAM)
-  const weightsGB = (paramsBillions * 1e9 * bytesPerParam) / 1e9;
+  // Weights: the GGUF on disk beats any parameter-count guess.
+  const ggufWeights = config.backend === "llama-server" ? ggufWeightsGB(config) : null;
+  const weightsGB = ggufWeights ?? (paramsBillions * 1e9 * bytesPerParam) / 1e9;
+  if (ggufWeights !== null) confidence = "exact";
 
-  // Calculate KV cache size (based on active params for MoE)
-  const maxModelLen = getMaxModelLen(config.extraArgs);
+  // KV cache scales with the context window and how it's quantized
+  const contextTokens = getMaxModelLen(config.extraArgs);
   const kvClass = getKvCacheClass(activeParamsBillions);
-  const kvCacheGB = (maxModelLen / 1024) * KV_CACHE_FACTOR[kvClass];
+  const kvBytesFactor = getKvCacheTypeBytes(config.extraArgs) / KV_CACHE_TYPE_BYTES.f16;
+  const kvCacheGB = (contextTokens / 1024) * KV_CACHE_FACTOR[kvClass] * kvBytesFactor;
 
-  // Activation overhead based on active params only (MoE benefit)
-  const activationGB = (activeParamsBillions * 1e9 * bytesPerParam) / 1e9 * (ACTIVATION_OVERHEAD - 1);
+  // Compute buffers: roughly constant, plus a context-driven slice
+  const activationGB = ACTIVATION_BASE_GB + (contextTokens / 1024) * ACTIVATION_PER_1K_CTX_GB;
 
   // Total
   const totalVRAM = weightsGB + kvCacheGB + activationGB + CUDA_OVERHEAD_GB;
@@ -230,16 +337,245 @@ export function estimateVRAM(config: {
   };
 }
 
+// ─── GGUF header estimation ─────────────────────────────────────
+
+/** Everything the GGUF header tells us that bears on VRAM, backend flags aside. */
+interface GgufShape {
+  weightsBytes: number;
+  /** KV elements per token, summed over the layers that actually have a cache. */
+  kvElementsPerToken: number;
+  /** Recurrent (SSM) state per sequence — constant, unlike the KV cache. */
+  recurrentBytesPerSeq: number;
+  embeddingLength: number;
+  parametersBillions: number;
+}
+
+const GGUF_HTTP_TIMEOUT_MS = 20_000;
+
+/** Element size of the safetensors dtypes the HuggingFace API reports. */
+const SAFETENSORS_DTYPE_BYTES: Record<string, number> = {
+  F64: 8,
+  F32: 4,
+  F16: 2,
+  BF16: 2,
+  F8_E4M3: 1,
+  F8_E5M2: 1,
+  I64: 8,
+  I32: 4,
+  I16: 2,
+  I8: 1,
+  U8: 1,
+  BOOL: 1,
+};
+/** Constant slice of the compute buffers: graph scratch, CUDA/Vulkan context. */
+const COMPUTE_BUFFER_BASE_GB = 0.5;
+/** Activation tensors of ubatch × embedding_length in flight at once, in f32. */
+const COMPUTE_BUFFER_TENSORS = 8;
+
+/** Parsed headers, keyed by file path + mtime (local) or URL (remote). */
+const ggufShapeCache = new Map<string, Promise<GgufShape | null>>();
+
+function ggufNumber(md: Record<string, unknown>, key: string): number | undefined {
+  const value = md[key];
+  if (typeof value === "number") return value;
+  if (typeof value === "bigint") return Number(value);
+  return undefined;
+}
+
+function ggufShape(parsed: GGUFParseOutput): GgufShape {
+  const md = parsed.metadata as unknown as Record<string, unknown>;
+  const arch = String(md["general.architecture"] ?? "");
+  const num = (key: string) => ggufNumber(md, `${arch}.${key}`);
+
+  const blocks = num("block_count") ?? 0;
+  const embed = num("embedding_length") ?? 0;
+  const heads = num("attention.head_count") ?? 0;
+  const headDim = num("attention.key_length") ?? (heads > 0 ? embed / heads : 0);
+  const valueDim = num("attention.value_length") ?? headDim;
+
+  // Hybrid stacks give a KV cache only to their full-attention layers; the rest
+  // carry a recurrent state instead. Counting all of them as attention layers
+  // overstates the cache by the ratio between the two (4x on Qwen3.5-style
+  // models). GGUFs express the split either per layer or as an interval.
+  const perLayerKvHeads = md[`${arch}.attention.head_count_kv`];
+  const interval = num("full_attention_interval") ?? 0;
+  const attentionLayers = interval > 1 ? Math.floor(blocks / interval) : blocks;
+  const kvHeads = Array.isArray(perLayerKvHeads)
+    ? perLayerKvHeads.reduce((sum: number, h) => sum + Number(h), 0)
+    : attentionLayers * (num("attention.head_count_kv") ?? heads);
+
+  const convKernel = num("ssm.conv_kernel") ?? 0;
+  const innerSize = num("ssm.inner_size") ?? 0;
+  const stateSize = num("ssm.state_size") ?? 0;
+  const groups = num("ssm.group_count") ?? 1;
+  const recurrentLayers = blocks - attentionLayers;
+  const recurrentBytesPerSeq =
+    recurrentLayers > 0 && innerSize > 0
+      ? recurrentLayers *
+        ((convKernel - 1) * (innerSize + 2 * groups * stateSize) + innerSize * stateSize) *
+        4
+      : 0;
+
+  let weightsBytes = 0;
+  let elements = 0;
+  for (const tensor of parsed.tensorInfos) {
+    const numel = Number(tensor.shape.reduce((a, b) => a * b, 1n));
+    elements += numel;
+    // An unknown type is a new quantization we have no size for; a byte per
+    // element keeps the total in the right order of magnitude.
+    weightsBytes += numel * (GGML_TYPE_BYTES[tensor.dtype] ?? 1);
+  }
+
+  return {
+    weightsBytes,
+    kvElementsPerToken: kvHeads * (headDim + valueDim),
+    recurrentBytesPerSeq,
+    embeddingLength: embed,
+    parametersBillions: elements / 1e9,
+  };
+}
+
+/** fetch with a deadline, so a stalled range request can't hold up a start. */
+const timedFetch = Object.assign(
+  (input: RequestInfo | URL, init?: RequestInit) =>
+    fetch(input, { ...init, signal: AbortSignal.timeout(GGUF_HTTP_TIMEOUT_MS) }),
+  { preconnect: fetch.preconnect }
+);
+
 /**
- * Check if a model can fit in available GPU memory.
+ * Read a GGUF header. Local files are read directly; remote ones cost a few
+ * range requests against the repo instead of the whole multi-GB download.
  */
-export function canFitInMemory(
-  estimatedVRAM: number,
-  availableVRAM: number,
-  gpuMemoryUtil: number = 0.9
-): boolean {
-  const usableVRAM = availableVRAM * gpuMemoryUtil;
-  return estimatedVRAM <= usableVRAM;
+function readGgufShape(uri: string, allowLocalFile: boolean): Promise<GgufShape | null> {
+  const token = process.env.HF_TOKEN;
+  return gguf(uri, {
+    allowLocalFile,
+    additionalFetchHeaders: token ? { Authorization: `Bearer ${token}` } : {},
+    fetch: timedFetch,
+  })
+    .then(ggufShape)
+    .catch((err) => {
+      console.warn(`[model-size] Could not parse GGUF header at ${uri}: ${err}`);
+      return null;
+    });
+}
+
+function cachedGgufShape(uri: string, allowLocalFile: boolean): Promise<GgufShape | null> {
+  let key = uri;
+  if (allowLocalFile) {
+    try {
+      key = `${uri}:${statSync(uri).mtimeMs}`;
+    } catch {
+      return Promise.resolve(null);
+    }
+  }
+  let shape = ggufShapeCache.get(key);
+  if (!shape) {
+    shape = readGgufShape(uri, allowLocalFile);
+    ggufShapeCache.set(key, shape);
+  }
+  return shape;
+}
+
+/** Turn a parsed header into an estimate for the flags this model runs with. */
+function ggufEstimate(
+  shape: GgufShape,
+  config: ModelConfig,
+  confidence: ModelSizeEstimate["confidence"]
+): ModelSizeEstimate {
+  const contextTokens = getMaxModelLen(config.extraArgs);
+  const slots = intArg(config.extraArgs, 1, "--parallel", "-np");
+  const ubatch = intArg(config.extraArgs, 512, "--ubatch-size", "-ub");
+
+  const weightsGB = shape.weightsBytes / GIB;
+  const kvCacheGB =
+    (shape.kvElementsPerToken * getKvCacheTypeBytes(config.extraArgs) * contextTokens * slots +
+      shape.recurrentBytesPerSeq * slots) /
+    GIB;
+  const computeGB =
+    COMPUTE_BUFFER_BASE_GB + (ubatch * shape.embeddingLength * 4 * COMPUTE_BUFFER_TENSORS) / GIB;
+
+  return {
+    parametersBillions: Math.round(shape.parametersBillions * 100) / 100,
+    weightsGB: Math.round(weightsGB * 100) / 100,
+    kvCacheGB: Math.round(kvCacheGB * 100) / 100,
+    totalVRAM: Math.round((weightsGB + kvCacheGB + computeGB) * 100) / 100,
+    confidence,
+  };
+}
+
+/**
+ * VRAM this model needs, from the best source available: the GGUF header on
+ * disk, the same header fetched from HuggingFace when the file isn't
+ * downloaded yet, the configured vramGB, and finally the parameter-count
+ * heuristic. The remote step is what lets admission run before a download.
+ */
+export async function resolveEstimate(config: ModelConfig): Promise<ModelSizeEstimate> {
+  if (config.backend === "llama-server") {
+    const localPath = resolveModelPath(config);
+    const local = await cachedGgufShape(localPath, true);
+    if (local) return ggufEstimate(local, config, "gguf-local");
+
+    if (!isLocalModel(config.modelPath) && config.modelFile) {
+      const remote = await cachedGgufShape(hfFileUrl(config.modelPath, config.modelFile), false);
+      if (remote) return ggufEstimate(remote, config, "gguf-remote");
+    }
+  }
+
+  const estimate = estimateVRAM(config);
+  if (config.vramGB !== undefined) {
+    return { ...estimate, totalVRAM: config.vramGB, confidence: "manual" };
+  }
+  return estimate;
+}
+
+/** Repo weight sizes already fetched, keyed by repo id. */
+const repoWeightsCache = new Map<string, Promise<number | null>>();
+
+/**
+ * Weights alone for a HuggingFace repo, from the safetensors index the API
+ * already publishes. Null when the repo doesn't report one.
+ */
+export function fetchRepoWeightsGB(config: ModelConfig): Promise<number | null> {
+  let pending = repoWeightsCache.get(config.modelPath);
+  if (!pending) {
+    pending = readRepoWeightsGB(config);
+    repoWeightsCache.set(config.modelPath, pending);
+  }
+  return pending;
+}
+
+async function readRepoWeightsGB(config: ModelConfig): Promise<number | null> {
+  if (isLocalModel(config.modelPath)) return null;
+  try {
+    const token = process.env.HF_TOKEN;
+    const r = await fetch(`https://huggingface.co/api/models/${config.modelPath}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      signal: AbortSignal.timeout(GGUF_HTTP_TIMEOUT_MS),
+    });
+    if (!r.ok) return null;
+    const info = (await r.json()) as {
+      safetensors?: { parameters?: Record<string, number> };
+      config?: { quantization_config?: { bits?: number } };
+    };
+    const parameters = info.safetensors?.parameters;
+    if (!parameters) return null;
+
+    // Quantized checkpoints report their packed weights under an integer
+    // dtype; what those cost is the quantization's bit width, not the
+    // container's. Float buckets (norms, embeddings, unquantized modules) are
+    // stored at face value.
+    const quantBits = info.config?.quantization_config?.bits;
+    let bytes = 0;
+    for (const [dtype, count] of Object.entries(parameters)) {
+      const elementBytes = SAFETENSORS_DTYPE_BYTES[dtype.toUpperCase()] ?? 2;
+      const isFloat = /^(F|BF)\d/.test(dtype.toUpperCase());
+      bytes += count * (!isFloat && quantBits ? quantBits / 8 : elementBytes);
+    }
+    return bytes / GIB;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -253,43 +589,82 @@ export interface GpuInfo {
   freeMemoryMB: number;
 }
 
+/** Run an nvidia-smi query, returning its CSV rows already split by column. */
+async function nvidiaSmi(query: string): Promise<string[][]> {
+  try {
+    const proc = Bun.spawn({
+      cmd: ["nvidia-smi", query, "--format=csv,noheader,nounits"],
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+
+    const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    if (exitCode !== 0) {
+      console.error(`[model-size] nvidia-smi ${query} failed`);
+      return [];
+    }
+
+    return stdout
+      .trim()
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .map((line) => line.split(",").map((cell) => cell.trim()));
+  } catch (err) {
+    console.error("[model-size] Failed to run nvidia-smi:", err);
+    return [];
+  }
+}
+
 /**
  * Query GPU memory status via nvidia-smi.
  */
 export async function getGpuInfo(): Promise<GpuInfo[]> {
-  try {
-    const result = Bun.spawnSync({
-      cmd: [
-        "nvidia-smi",
-        "--query-gpu=index,name,memory.total,memory.used,memory.free",
-        "--format=csv,noheader,nounits",
-      ],
-    });
+  const rows = await nvidiaSmi("--query-gpu=index,name,memory.total,memory.used,memory.free");
+  return rows.map(([index, name, total, used, free]) => ({
+    index: parseInt(index),
+    name,
+    totalMemoryMB: parseInt(total),
+    usedMemoryMB: parseInt(used),
+    freeMemoryMB: parseInt(free),
+  }));
+}
 
-    if (result.exitCode !== 0) {
-      console.error("[model-size] nvidia-smi failed");
-      return [];
-    }
+/** One process's memory on one GPU, as the driver accounts for it. */
+export interface ComputeApp {
+  gpu: number;
+  pid: number;
+  usedMemoryMB: number;
+}
 
-    const output = result.stdout.toString().trim();
-    const gpus: GpuInfo[] = [];
+/** GPU index per UUID. Fixed for the life of the driver, so read once. */
+let gpuIndexByUuid: Promise<Map<string, number>> | null = null;
 
-    for (const line of output.split("\n")) {
-      const [index, name, total, used, free] = line.split(", ").map((s) => s.trim());
-      gpus.push({
-        index: parseInt(index),
-        name,
-        totalMemoryMB: parseInt(total),
-        usedMemoryMB: parseInt(used),
-        freeMemoryMB: parseInt(free),
-      });
-    }
-
-    return gpus;
-  } catch (err) {
-    console.error("[model-size] Failed to query GPU info:", err);
-    return [];
+function readGpuIndexByUuid(): Promise<Map<string, number>> {
+  if (!gpuIndexByUuid) {
+    gpuIndexByUuid = nvidiaSmi("--query-gpu=index,uuid").then(
+      (rows) => new Map(rows.map(([index, uuid]) => [uuid, parseInt(index)]))
+    );
   }
+  return gpuIndexByUuid;
+}
+
+/**
+ * Per-process GPU memory. This is CUDA accounting: processes using the GPU
+ * through another API — a Vulkan build of llama.cpp, say — hold real memory
+ * without ever showing up here.
+ */
+export async function getComputeApps(): Promise<ComputeApp[]> {
+  const [rows, indexByUuid] = await Promise.all([
+    nvidiaSmi("--query-compute-apps=gpu_uuid,pid,used_memory"),
+    readGpuIndexByUuid(),
+  ]);
+  const apps: ComputeApp[] = [];
+  for (const [uuid, pid, used] of rows) {
+    const gpu = indexByUuid.get(uuid);
+    if (gpu === undefined) continue;
+    apps.push({ gpu, pid: parseInt(pid), usedMemoryMB: parseInt(used) });
+  }
+  return apps;
 }
 
 /**

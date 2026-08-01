@@ -16,8 +16,13 @@
 import type { ModelConfig } from "./config";
 import { getInternalPort, reloadModelConfig as reloadModelConfigFromDisk } from "./config";
 import { createProcess, type BackendProcess, type ExitInfo } from "./process";
-import { downloadModel, isLocalModel } from "./download";
-import { EvictionCooldownError, type GpuLock, type GpuOwner } from "./gpu-lock";
+import { downloadModel, isLocalModel, isModelCached } from "./download";
+import {
+  EvictionCooldownError,
+  InsufficientVRAMError,
+  type GpuLock,
+  type GpuOwner,
+} from "./gpu-lock";
 
 // ─── Types ──────────────────────────────────────────────────────
 
@@ -255,6 +260,7 @@ function makeGpuOwner(entry: ModelEntry): GpuOwner {
     config: entry.config,
     isRunning: () => entry.process.status === "running",
     stopProcess: () => entry.process.stop(),
+    pids: () => entry.process.groupPids(),
   };
 }
 
@@ -649,6 +655,10 @@ export class UnifiedProxy {
         { status: 503, headers: { "Retry-After": String(err.retryAfterSeconds) } }
       );
     }
+    // 507: the request was fine, the hardware isn't. Retrying won't help.
+    if (err instanceof InsufficientVRAMError) {
+      return Response.json({ error: err.message }, { status: 507 });
+    }
     return Response.json(
       { error: "Model failed to start", details: String(err) },
       { status: 503 }
@@ -804,6 +814,12 @@ export class UnifiedProxy {
   private async ensureRunningLocked(entry: ModelEntry): Promise<void> {
     // Step 1: Download if needed (HF models only)
     if (!isLocalModel(entry.config.modelPath)) {
+      // A model we don't have yet gets sized from its remote header first: 16GB
+      // is a long way to travel to find out it was never going to fit.
+      if (!entry.downloading && !(await isModelCached(entry.config.modelPath, entry.config.modelFile))) {
+        await this.gpuLock.assertCanFit(makeGpuOwner(entry));
+      }
+
       if (entry.downloading) {
         // Wait for existing download to complete
         await new Promise<void>((resolve, reject) => {
@@ -1101,7 +1117,9 @@ export class UnifiedProxy {
           await this.startModel(entry);
           return Response.json({ status: "running", model: name });
         } catch (err) {
-          if (err instanceof EvictionCooldownError) return this.startFailureResponse(err);
+          if (err instanceof EvictionCooldownError || err instanceof InsufficientVRAMError) {
+            return this.startFailureResponse(err);
+          }
           return Response.json({ error: String(err) }, { status: 500 });
         }
       }

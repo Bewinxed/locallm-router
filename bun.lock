@@ -1,0 +1,17 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "locallm-router",
+      "dependencies": {
+        "@huggingface/gguf": "^0.4.0",
+      },
+    },
+  },
+  "packages": {
+    "@huggingface/gguf": ["@huggingface/gguf@0.4.4", "", { "dependencies": { "@huggingface/tasks": "^0.21.28" }, "bin": { "gguf-view": "dist/cli.js" } }, "sha512-QtiyLddQpK0i/mTmedSubj/6lo1HQV/6LmagVhOUB/EH7j+Uma0uo1VJ9C+ueIum/Lxk4Lj3aU7tppzuC6gEcg=="],
+
+    "@huggingface/tasks": ["@huggingface/tasks@0.21.32", "", {}, "sha512-/5YjjnIytaVYbYyivesck4CE0SoNYj2guLJR2cSj2/zEGR5NmTWhPj47WXKAmyzCSX5OalfNXdpJtjNRdEKWZw=="],
+  }
+}

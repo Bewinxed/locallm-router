@@ -8,19 +8,56 @@
 
 import { spawn } from "child_process";
 
-const MODELS_DIR = process.env.HF_HOME || "/models";
+export const MODELS_DIR = process.env.HF_HOME || "/models";
 
 /** Check if a model path is a local file (GGUF, etc.) vs a HuggingFace repo */
 export function isLocalModel(modelPath: string): boolean {
   return modelPath.startsWith("/") || modelPath.startsWith("./");
 }
 
+/**
+ * Local path a single-file download (config.modelFile) resolves to.
+ * Kept outside the HF hub cache layout so the path is deterministic and
+ * llama-server can be pointed at it directly.
+ */
+export function singleFileLocalPath(modelPath: string, modelFile: string): string {
+  return `${MODELS_DIR}/gguf/${modelPath.replace("/", "--")}/${modelFile}`;
+}
+
+/**
+ * Direct URL to a file in an HF repo. Supports range requests, so a header can
+ * be read from it without pulling the file down.
+ */
+export function hfFileUrl(modelPath: string, modelFile: string): string {
+  return `https://huggingface.co/${modelPath}/resolve/main/${modelFile}`;
+}
+
+/**
+ * The path a backend should actually load: the local file itself, the
+ * single-file download location, or the HF repo ID (vLLM/SGLang resolve
+ * repos natively).
+ */
+export function resolveModelPath(config: { modelPath: string; modelFile?: string }): string {
+  if (isLocalModel(config.modelPath)) return config.modelPath;
+  if (config.modelFile) return singleFileLocalPath(config.modelPath, config.modelFile);
+  return config.modelPath;
+}
+
+/** The CLI downloader: prefer the modern `hf`, fall back to `huggingface-cli`. */
+function downloaderBin(): string {
+  return Bun.which("hf") ? "hf" : "huggingface-cli";
+}
+
 /** Check if an HF model is already downloaded (has a snapshot) */
-export async function isModelCached(modelPath: string): Promise<boolean> {
+export async function isModelCached(modelPath: string, modelFile?: string): Promise<boolean> {
   if (isLocalModel(modelPath)) {
     // For local files, check if file exists
     const file = Bun.file(modelPath);
     return file.exists();
+  }
+
+  if (modelFile) {
+    return Bun.file(singleFileLocalPath(modelPath, modelFile)).exists();
   }
 
   const repoDir = modelPath.replace("/", "--");
@@ -36,10 +73,11 @@ export async function isModelCached(modelPath: string): Promise<boolean> {
   }
 }
 
-/** Download an HF model using huggingface-cli. Returns when download completes. */
+/** Download an HF model using the HF CLI. Returns when download completes. */
 export async function downloadModel(
   modelPath: string,
-  onProgress?: (line: string) => void
+  onProgress?: (line: string) => void,
+  modelFile?: string
 ): Promise<void> {
   if (isLocalModel(modelPath)) {
     const exists = await isModelCached(modelPath);
@@ -49,18 +87,27 @@ export async function downloadModel(
     return; // Already exists
   }
 
-  const cached = await isModelCached(modelPath);
+  const cached = await isModelCached(modelPath, modelFile);
   if (cached) {
     onProgress?.(`Model ${modelPath} already cached`);
     return;
   }
 
-  onProgress?.(`Downloading ${modelPath} to ${MODELS_DIR}...`);
+  onProgress?.(`Downloading ${modelPath}${modelFile ? `/${modelFile}` : ""} to ${MODELS_DIR}...`);
+
+  // Single-file downloads (GGUF quants) land in a deterministic local dir;
+  // whole-repo downloads use the standard HF hub cache.
+  const args = modelFile
+    ? [
+        "download", modelPath, modelFile,
+        "--local-dir", `${MODELS_DIR}/gguf/${modelPath.replace("/", "--")}`,
+      ]
+    : ["download", modelPath, "--cache-dir", `${MODELS_DIR}/hub`];
 
   return new Promise((resolve, reject) => {
     const proc = spawn(
-      "huggingface-cli",
-      ["download", modelPath, "--cache-dir", `${MODELS_DIR}/hub`],
+      downloaderBin(),
+      args,
       {
         env: {
           ...process.env,

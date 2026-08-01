@@ -16,7 +16,7 @@ import type { Subprocess } from "bun";
 import { readdirSync, readFileSync } from "fs";
 import type { ModelConfig } from "./config";
 import { resolveModelPath } from "./download";
-import { getGpuInfo } from "./model-size";
+import { argValue, getGpuInfo } from "./model-size";
 
 export type ProcessStatus = "stopped" | "starting" | "running" | "stopping" | "sleeping";
 
@@ -82,6 +82,8 @@ interface BackendDescriptor {
   buildArgs(config: ModelConfig, port: number): string[];
   buildEnv(config: ModelConfig): Record<string, string>;
   isReadyLog(text: string): boolean;
+  /** Feature detection this backend needs before its args can be built. */
+  prepare?(): Promise<void>;
 }
 
 function cudaDevices(config: ModelConfig): string {
@@ -102,8 +104,51 @@ function ncclEnv(config: ModelConfig): Record<string, string> {
     NCCL_P2P_DISABLE: "1",
     NCCL_IB_DISABLE: "1",
     NCCL_SHM_DISABLE: "1",
+    // Tensor parallelism here is single-node, so the bootstrap never has to
+    // leave the box. Left to itself NCCL picks the first routable interface —
+    // on this machine the WiFi adapter — and a collective that can't connect
+    // there wedges the whole start for minutes before it gives up.
+    NCCL_SOCKET_IFNAME: "lo",
     NCCL_DEBUG: "WARN",
   };
+}
+
+/**
+ * Whether the installed llama-server understands --fit-ctx. Probed once, on
+ * the first launch: an older build errors out on an unknown flag, and a
+ * working setup must not break because we added a guard to it.
+ */
+let fitCtxSupported: boolean | null = null;
+
+async function probeFitCtxSupport(): Promise<void> {
+  if (fitCtxSupported !== null) return;
+  try {
+    const proc = Bun.spawn({
+      cmd: [BACKENDS["llama-server"].binary, "--help"],
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const [stdout] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    fitCtxSupported = stdout.includes("--fit-ctx");
+  } catch {
+    fitCtxSupported = false;
+  }
+  console.log(
+    `[process] llama-server ${fitCtxSupported ? "supports" : "does not support"} --fit-ctx`
+  );
+}
+
+/**
+ * llama.cpp's --fit is on by default in recent builds: rather than failing to
+ * fit, it quietly shrinks the context and serves less than was asked for.
+ * Pinning the floor to the requested context turns that back into a startup
+ * error we can see.
+ */
+function fitCtxArgs(extraArgs: string[]): string[] {
+  if (!fitCtxSupported) return [];
+  if (extraArgs.some((arg) => ["--fit", "-fit", "--fit-ctx", "-fitc"].includes(arg))) return [];
+  const ctx = argValue(extraArgs, "-c", "--ctx-size");
+  return ctx ? ["--fit-ctx", ctx] : [];
 }
 
 const BACKENDS: Record<string, BackendDescriptor> = {
@@ -148,7 +193,9 @@ const BACKENDS: Record<string, BackendDescriptor> = {
       "--host", "127.0.0.1",
       "-a", config.name,
       ...(config.extraArgs || []),
+      ...fitCtxArgs(config.extraArgs || []),
     ],
+    prepare: probeFitCtxSupport,
     buildEnv: (config) => ({
       CUDA_VISIBLE_DEVICES: cudaDevices(config),
       // Vulkan builds of llama.cpp ignore CUDA_VISIBLE_DEVICES; this is the
@@ -219,6 +266,12 @@ export class BackendProcess {
 
   private startPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
+  /**
+   * Set the moment a stop is asked for. A model evicted between start() and
+   * the spawn would otherwise finish launching into VRAM that has already been
+   * promised to someone else.
+   */
+  private stopRequested = false;
   /** Set while a startup is in flight: fed by the log drain, settled by exits. */
   private onLogLine: ((line: string) => void) | null = null;
   private failStartup: ((err: Error) => void) | null = null;
@@ -265,6 +318,7 @@ export class BackendProcess {
     // A stop already in flight — an eviction, say — owns the port until it
     // finishes; spawning into it would leave two backends fighting over it.
     if (this.stopPromise) await this.stopPromise.catch(() => {});
+    this.stopRequested = false;
     if (this.state === "sleeping") {
       if (await this.wake()) return;
       await this.stop();
@@ -279,6 +333,7 @@ export class BackendProcess {
   }
 
   async stop(): Promise<void> {
+    this.stopRequested = true;
     if (!this.stopPromise) {
       this.stopPromise = this.terminate().finally(() => {
         this.stopPromise = null;
@@ -295,6 +350,23 @@ export class BackendProcess {
   /** Synchronous best-effort kill, for the router's own exit handler. */
   killNow(): void {
     if (this.proc) this.signal(this.proc, "SIGKILL");
+  }
+
+  /**
+   * Every pid holding this backend's GPU memory: the child we spawned plus the
+   * workers it forked, which are its process group (see SETSID_BIN).
+   */
+  groupPids(): number[] {
+    const pid = this.proc?.pid;
+    if (pid === undefined) return [];
+    return SETSID_BIN ? processGroupMembers(pid) : [pid];
+  }
+
+  /** Abort a launch that a stop overtook, rather than starting it anyway. */
+  private assertNotStopping(): void {
+    if (this.stopRequested) {
+      throw new Error(`${this.config.name} was stopped during startup`);
+    }
   }
 
   /** Put the model to sleep (offload weights to CPU). vLLM only. */
@@ -344,9 +416,14 @@ export class BackendProcess {
 
   private async launch(): Promise<void> {
     await this.claimPort();
+    await this.backend.prepare?.();
 
     const args = this.backend.buildArgs(this.config, this.internalPort);
     const env = { ...allowedEnv(), ...this.backend.buildEnv(this.config) };
+
+    // Last check before the spawn: everything above here can await, and a stop
+    // that lands in one of those gaps has nothing to kill yet.
+    this.assertNotStopping();
 
     this.state = "starting";
     this.lastError = null;
@@ -436,6 +513,10 @@ export class BackendProcess {
       };
 
       const probe = () => {
+        if (this.stopRequested) {
+          settle(new Error(`${this.backend.label} was stopped during startup`));
+          return;
+        }
         void this.probeHealth(proc).then((ready) => {
           if (!ready || settled) return;
           this.state = "running";

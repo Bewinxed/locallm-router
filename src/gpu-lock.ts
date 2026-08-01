@@ -9,9 +9,12 @@
 import { readFileSync, writeFileSync } from "fs";
 import {
   estimateVRAM,
+  fetchRepoWeightsGB,
+  getComputeApps,
   getGpuInfo,
   formatEstimate,
   getGpuMemoryUtil,
+  resolveEstimate,
   type ModelSizeEstimate,
 } from "./model-size";
 import { MODELS_DIR } from "./download";
@@ -24,6 +27,8 @@ export interface GpuOwner {
   readonly config: ModelConfig;
   isRunning(): boolean;
   stopProcess(): Promise<void>;
+  /** Pids of the backend's process group; empty when it isn't running. */
+  pids(): number[];
 }
 
 interface LoadedModel {
@@ -43,6 +48,14 @@ interface EvictionRecord {
 const VRAM_HEADROOM_GB = 1.0;
 const ANTI_THRASH_COOLDOWN_MS = 30_000;
 const VRAM_SNAPSHOT_SETTLE_MS = 3_000;
+
+/** Thrown when a model cannot be made to fit, even by evicting everything else. */
+export class InsufficientVRAMError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InsufficientVRAMError";
+  }
+}
 
 /** Thrown when a just-evicted model is asked to reload into contended VRAM. */
 export class EvictionCooldownError extends Error {
@@ -66,10 +79,30 @@ export class EvictionCooldownError extends Error {
  */
 const OBSERVED_VRAM_PATH = `${MODELS_DIR}/.locallm-router-observed.json`;
 
-function loadObservedVRAM(): Map<string, number> {
+interface ObservedVRAM {
+  gb: number;
+  /** True when the number came from per-process accounting rather than a delta. */
+  perProcess: boolean;
+}
+
+/** Older files hold a bare number; those were all whole-GPU deltas. */
+function parseObserved(value: unknown): ObservedVRAM | null {
+  if (typeof value === "number" && value > 0) return { gb: value, perProcess: false };
+  if (value && typeof value === "object") {
+    const { gb, perProcess } = value as Partial<ObservedVRAM>;
+    if (typeof gb === "number" && gb > 0) return { gb, perProcess: perProcess === true };
+  }
+  return null;
+}
+
+function loadObservedVRAM(): Map<string, ObservedVRAM> {
   try {
-    const raw = JSON.parse(readFileSync(OBSERVED_VRAM_PATH, "utf-8")) as Record<string, number>;
-    const entries = Object.entries(raw).filter(([, gb]) => typeof gb === "number" && gb > 0);
+    const raw = JSON.parse(readFileSync(OBSERVED_VRAM_PATH, "utf-8")) as Record<string, unknown>;
+    const entries: [string, ObservedVRAM][] = [];
+    for (const [name, value] of Object.entries(raw)) {
+      const observed = parseObserved(value);
+      if (observed) entries.push([name, observed]);
+    }
     if (entries.length > 0) {
       console.log(`[gpu-lock] Loaded observed VRAM for ${entries.length} model(s) from ${OBSERVED_VRAM_PATH}`);
     }
@@ -81,13 +114,22 @@ function loadObservedVRAM(): Map<string, number> {
 
 const observedVRAM = loadObservedVRAM();
 
-function persistObservedVRAM(modelName: string, gb: number): void {
-  observedVRAM.set(modelName, Math.round(gb * 100) / 100);
+/**
+ * Record a measurement, unless it is a whole-GPU delta about to overwrite a
+ * per-process number — the delta is the one that picks up a predecessor's
+ * memory on its way out, so it doesn't get to win.
+ */
+function persistObservedVRAM(modelName: string, gb: number, perProcess: boolean): boolean {
+  const prior = observedVRAM.get(modelName);
+  if (!perProcess && prior?.perProcess) return false;
+
+  observedVRAM.set(modelName, { gb: Math.round(gb * 100) / 100, perProcess });
   try {
     writeFileSync(OBSERVED_VRAM_PATH, JSON.stringify(Object.fromEntries(observedVRAM), null, 2));
   } catch (err) {
     console.warn(`[gpu-lock] Could not persist observed VRAM to ${OBSERVED_VRAM_PATH}:`, err);
   }
+  return true;
 }
 
 class GpuScheduler {
@@ -97,11 +139,16 @@ class GpuScheduler {
   private initPromise: Promise<void> | null = null;
   private loaded = new Map<string, LoadedModel>();
   private estimates = new Map<string, ModelSizeEstimate>();
+  private estimateRefresh = new Map<string, Promise<void>>();
   private recentEvictions: EvictionRecord[] = [];
   private lastReconcileTime = 0;
+  /** VRAM held on this card by anything the router didn't start. */
+  private otherUsageGB = 0;
+  private otherUsageAt = 0;
   /** Serializes acquire() so two cold starts can't both claim the same VRAM. */
   private queue: Promise<unknown> = Promise.resolve();
   private static readonly RECONCILE_INTERVAL_MS = 5000;
+  private static readonly OTHER_USAGE_TTL_MS = 5000;
 
   constructor(gpu: number) {
     this.gpu = gpu;
@@ -130,12 +177,23 @@ class GpuScheduler {
   }
 
   registerModel(owner: GpuOwner): void {
-    let estimate = estimateVRAM(owner.config);
-    if (owner.config.vramGB !== undefined) {
-      estimate = { ...estimate, totalVRAM: owner.config.vramGB, confidence: "manual" as any };
+    this.setEstimate(owner, estimateVRAM(owner.config));
+    void this.ensureEstimate(owner);
+    void this.warnIfWeightsExceedPrealloc(owner);
+
+    const observed = observedVRAM.get(owner.name);
+    if (observed !== undefined) {
+      console.log(
+        `[gpu-lock] GPU ${this.gpu}: ${owner.name} previously observed at ${observed.gb.toFixed(1)}GB` +
+          (observed.perProcess ? "" : " (whole-GPU delta)")
+      );
     }
+  }
+
+  /** A model's estimate is for one card; a tensor-parallel one splits across them. */
+  private setEstimate(owner: GpuOwner, estimate: ModelSizeEstimate): void {
     const numGpus = owner.gpus ? owner.gpus.length : 1;
-    const perGpuEstimate: typeof estimate =
+    const perGpuEstimate: ModelSizeEstimate =
       numGpus > 1
         ? {
             ...estimate,
@@ -145,16 +203,67 @@ class GpuScheduler {
           }
         : estimate;
     this.estimates.set(owner.name, perGpuEstimate);
-    const observed = observedVRAM.get(owner.name);
-    if (numGpus > 1) {
-      console.log(
-        `[gpu-lock] GPU ${this.gpu}: ${owner.name} -> ${formatEstimate(estimate)} (${estimate.totalVRAM.toFixed(1)}GB total / ${numGpus} GPUs = ${perGpuEstimate.totalVRAM.toFixed(1)}GB here)`
-      );
-    } else {
+  }
+
+  private logEstimate(owner: GpuOwner, estimate: ModelSizeEstimate): void {
+    const numGpus = owner.gpus ? owner.gpus.length : 1;
+    if (numGpus === 1) {
       console.log(`[gpu-lock] GPU ${this.gpu}: ${owner.name} -> ${formatEstimate(estimate)}`);
+      return;
     }
-    if (observed !== undefined) {
-      console.log(`[gpu-lock] GPU ${this.gpu}: ${owner.name} previously observed at ${observed.toFixed(1)}GB`);
+    const perGpuGB = this.estimates.get(owner.name)?.totalVRAM ?? estimate.totalVRAM / numGpus;
+    console.log(
+      `[gpu-lock] GPU ${this.gpu}: ${owner.name} -> ${formatEstimate(estimate)} (${estimate.totalVRAM.toFixed(1)}GB total / ${numGpus} GPUs = ${perGpuGB.toFixed(1)}GB here)`
+    );
+  }
+
+  /**
+   * Replace the boot-time guess with what the model file actually says. The
+   * header read is remote when the model isn't downloaded yet, so this is also
+   * how a model gets a size before it costs us a download.
+   */
+  private ensureEstimate(owner: GpuOwner): Promise<void> {
+    let pending = this.estimateRefresh.get(owner.name);
+    if (!pending) {
+      pending = resolveEstimate(owner.config)
+        .then((estimate) => {
+          this.setEstimate(owner, estimate);
+          this.logEstimate(owner, estimate);
+        })
+        .catch((err) => {
+          console.warn(`[gpu-lock] GPU ${this.gpu}: could not size ${owner.name}:`, err);
+        })
+        .finally(() => {
+          // Anything short of a parsed header is worth retrying: the file may
+          // be on disk, or the network back, by the next admission decision.
+          if (!this.estimates.get(owner.name)?.confidence.startsWith("gguf")) {
+            this.estimateRefresh.delete(owner.name);
+          }
+        });
+      this.estimateRefresh.set(owner.name, pending);
+    }
+    return pending;
+  }
+
+  /**
+   * vLLM is admitted on its prealloc budget rather than an estimate, but if its
+   * weights alone don't fit in that budget it will OOM part-way through a
+   * multi-minute load. Better to say so at startup than to find out then.
+   */
+  private async warnIfWeightsExceedPrealloc(owner: GpuOwner): Promise<void> {
+    await this.initialize();
+    const floor = this.preallocFloor(owner.config);
+    if (floor <= 0) return;
+
+    const weightsGB = await fetchRepoWeightsGB(owner.config);
+    if (weightsGB === null) return;
+
+    const share = weightsGB / (owner.gpus?.length ?? 1);
+    if (share > floor) {
+      console.warn(
+        `[gpu-lock] GPU ${this.gpu}: ${owner.name} weights are ${share.toFixed(1)}GB per GPU but ` +
+          `--gpu-memory-utilization only budgets ${floor.toFixed(1)}GB — it will not load`
+      );
     }
   }
 
@@ -186,7 +295,11 @@ class GpuScheduler {
   private expectedVRAM(owner: GpuOwner): number {
     const estimate = this.estimates.get(owner.name);
     if (!estimate) throw new Error(`Model ${owner.name} not registered`);
-    return this.footprint(owner.config, estimate.totalVRAM, observedVRAM.get(owner.name) ?? null);
+    return this.footprint(
+      owner.config,
+      estimate.totalVRAM,
+      observedVRAM.get(owner.name)?.gb ?? null
+    );
   }
 
   private getEstimatedVRAM(): number {
@@ -224,9 +337,24 @@ class GpuScheduler {
     }
   }
 
+  /**
+   * VRAM held on this card by processes the router didn't start — a desktop
+   * session is several GB on GPU 0 here. Accounting alone can't see it, so
+   * without this the scheduler hands the same memory out twice.
+   */
+  private async refreshOtherUsage(): Promise<void> {
+    const now = Date.now();
+    if (now - this.otherUsageAt < GpuScheduler.OTHER_USAGE_TTL_MS) return;
+    this.otherUsageAt = now;
+
+    const gpuInfo = (await getGpuInfo()).find((g) => g.index === this.gpu);
+    if (!gpuInfo) return;
+    this.otherUsageGB = Math.max(0, gpuInfo.usedMemoryMB / 1024 - this.getEstimatedVRAM());
+  }
+
   /** Room left on the card for a model that isn't resident yet. */
   private getAvailableVRAM(): number {
-    return this.totalVRAM - VRAM_HEADROOM_GB - this.getEstimatedVRAM();
+    return this.totalVRAM - VRAM_HEADROOM_GB - this.getEstimatedVRAM() - this.otherUsageGB;
   }
 
   /** Snapshot current GPU memory usage (call before model start) */
@@ -236,21 +364,53 @@ class GpuScheduler {
     return gpuInfo ? gpuInfo.usedMemoryMB / 1024 : 0;
   }
 
+  /**
+   * What this model holds on this card. Per-process accounting is the honest
+   * answer — a whole-GPU delta also counts whatever the model it replaced had
+   * not finished handing back, which is how an 18GB model once measured
+   * 11.6GB. But the driver only accounts for CUDA contexts: a Vulkan backend
+   * holds real memory and reports no rows at all, so for those we fall back to
+   * the delta and say that's what it is.
+   */
+  private async measureVRAM(
+    owner: GpuOwner,
+    preSnapshotGB: number
+  ): Promise<{ gb: number; perProcess: boolean }> {
+    const pids = new Set(owner.pids());
+    if (pids.size > 0) {
+      const rows = (await getComputeApps()).filter((a) => a.gpu === this.gpu && pids.has(a.pid));
+      if (rows.length > 0) {
+        const usedMB = rows.reduce((sum, a) => sum + a.usedMemoryMB, 0);
+        return { gb: usedMB / 1024, perProcess: true };
+      }
+    }
+    const postGB = await this.snapshotVRAM();
+    return { gb: Math.max(0, postGB - preSnapshotGB), perProcess: false };
+  }
+
   /** Record observed VRAM after a model finishes loading */
   async recordObservedVRAM(owner: GpuOwner, preSnapshotGB: number): Promise<void> {
     await new Promise((r) => setTimeout(r, VRAM_SNAPSHOT_SETTLE_MS));
-    const postGB = await this.snapshotVRAM();
-    const delta = Math.max(0, postGB - preSnapshotGB);
+    const { gb, perProcess } = await this.measureVRAM(owner, preSnapshotGB);
     const model = this.loaded.get(owner.name);
-    if (!model || delta < 0.5) return;
+    if (!model || gb < 0.5) return;
 
-    model.observedVRAM = delta;
-    persistObservedVRAM(owner.name, delta);
+    if (!persistObservedVRAM(owner.name, gb, perProcess)) {
+      console.log(
+        `[gpu-lock] GPU ${this.gpu}: ${owner.name} measured ${gb.toFixed(1)}GB by whole-GPU delta — ` +
+          `keeping the per-process ${observedVRAM.get(owner.name)!.gb.toFixed(1)}GB`
+      );
+      return;
+    }
+
+    model.observedVRAM = gb;
     const estGB = model.estimate.totalVRAM;
-    const drift = Math.abs(delta - estGB);
+    const drift = Math.abs(gb - estGB);
     if (drift > 1) {
       console.log(
-        `[gpu-lock] GPU ${this.gpu}: ${owner.name} observed ${delta.toFixed(1)}GB (estimated ${estGB.toFixed(1)}GB, drift ${drift.toFixed(1)}GB)`
+        `[gpu-lock] GPU ${this.gpu}: ${owner.name} observed ${gb.toFixed(1)}GB via ` +
+          `${perProcess ? "per-process accounting" : "whole-GPU delta"} ` +
+          `(estimated ${estGB.toFixed(1)}GB, drift ${drift.toFixed(1)}GB)`
       );
     }
   }
@@ -262,7 +422,7 @@ class GpuScheduler {
   refreshObservedVRAM(owner: GpuOwner): void {
     const model = this.loaded.get(owner.name);
     const observed = observedVRAM.get(owner.name);
-    if (model && observed !== undefined) model.observedVRAM = observed;
+    if (model && observed !== undefined) model.observedVRAM = observed.gb;
   }
 
   /** Milliseconds left on a model's anti-thrash cooldown, 0 when clear. */
@@ -305,15 +465,38 @@ class GpuScheduler {
   }
 
   /** Fail loudly with the numbers, so "it didn't fit" is never a mystery. */
-  private cannotFitError(owner: GpuOwner, needVRAM: number): Error {
+  private cannotFitError(owner: GpuOwner, needVRAM: number): InsufficientVRAMError {
     const residents = [...this.loaded.values()]
       .filter((m) => m.owner.name !== owner.name)
       .map((m) => `${m.owner.name} ${this.getModelVRAM(m).toFixed(1)}GB`);
-    return new Error(
+    return new InsufficientVRAMError(
       `Cannot fit ${owner.name} (${needVRAM.toFixed(1)}GB) on GPU ${this.gpu}: ` +
-        `${this.totalVRAM.toFixed(1)}GB total, ${VRAM_HEADROOM_GB.toFixed(1)}GB headroom, resident: ` +
+        `${this.totalVRAM.toFixed(1)}GB total, ${VRAM_HEADROOM_GB.toFixed(1)}GB headroom, ` +
+        `${this.otherUsageGB.toFixed(1)}GB used outside the router, resident: ` +
         (residents.length > 0 ? residents.join(", ") : "none")
     );
+  }
+
+  /**
+   * Would this model fit, evicting if it came to that? Reserves nothing and
+   * evicts nothing — it is the question asked before a download, when the
+   * answer decides whether the bytes are worth pulling at all.
+   */
+  async checkFit(owner: GpuOwner): Promise<void> {
+    await this.initialize();
+    await this.ensureEstimate(owner);
+    await this.refreshOtherUsage();
+    if (this.loaded.has(owner.name)) return;
+
+    const needVRAM = this.expectedVRAM(owner);
+    const available = this.getAvailableVRAM();
+    if (needVRAM <= available) return;
+
+    const freeable = this.getEvictionCandidates(needVRAM - available, owner.name).reduce(
+      (sum, m) => sum + this.getModelVRAM(m),
+      0
+    );
+    if (needVRAM > available + freeable) throw this.cannotFitError(owner, needVRAM);
   }
 
   /**
@@ -337,6 +520,9 @@ class GpuScheduler {
       this.loaded.get(owner.name)!.lastActivity = Date.now();
       return;
     }
+
+    await this.ensureEstimate(owner);
+    await this.refreshOtherUsage();
 
     const estimate = this.estimates.get(owner.name);
     if (!estimate) throw new Error(`Model ${owner.name} not registered`);
@@ -389,7 +575,7 @@ class GpuScheduler {
     this.loaded.set(owner.name, {
       owner,
       estimate,
-      observedVRAM: observedVRAM.get(owner.name) ?? null,
+      observedVRAM: observedVRAM.get(owner.name)?.gb ?? null,
       loadedAt: Date.now(),
       lastActivity: Date.now(),
     });
@@ -406,9 +592,11 @@ class GpuScheduler {
 
   async getStatus() {
     await this.reconcileWithGpu();
+    await this.refreshOtherUsage();
     return {
       totalVRAM: Math.round(this.totalVRAM * 100) / 100,
       usedVRAM: Math.round(this.getEstimatedVRAM() * 100) / 100,
+      otherVRAM: Math.round(this.otherUsageGB * 100) / 100,
       availableVRAM: Math.round(this.getAvailableVRAM() * 100) / 100,
       loaded: [...this.loaded.entries()].map(([name, m]) => ({
         name,
@@ -476,6 +664,16 @@ export class GpuLock {
         for (const held of acquired) held.notifyStopped(owner);
         throw err;
       }
+    }
+  }
+
+  /**
+   * Check every card this model would land on, without reserving anything.
+   * Throws InsufficientVRAMError when no amount of eviction would make room.
+   */
+  async assertCanFit(owner: GpuOwner): Promise<void> {
+    for (const gpuIdx of this.gpuIndices(owner)) {
+      await this.schedulerFor(gpuIdx).checkFit(owner);
     }
   }
 

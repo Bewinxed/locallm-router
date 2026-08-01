@@ -1,0 +1,42 @@
+{
+	"name": "locallm-router",
+	"version": "0.1.0",
+	"description": "A single OpenAI-compatible endpoint that lazily manages multiple local LLM backends across your GPUs",
+	"license": "MIT",
+	"type": "module",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Bewinxed/locallm-router.git"
+	},
+	"keywords": [
+		"llm",
+		"vllm",
+		"llama-cpp",
+		"sglang",
+		"openai",
+		"proxy",
+		"gpu",
+		"router"
+	],
+	"bin": {
+		"locallm-router": "./src/cli.ts"
+	},
+	"files": [
+		"src",
+		"dashboard/build",
+		"config.example.json",
+		"README.md"
+	],
+	"engines": {
+		"bun": ">=1.1.0"
+	},
+	"scripts": {
+		"start": "bun run src/index.ts",
+		"dev": "bun run src/index.ts",
+		"build:dashboard": "cd dashboard && bun install && bun run build",
+		"prepublishOnly": "bun run build:dashboard"
+	},
+	"dependencies": {
+		"@huggingface/gguf": "^0.4.0"
+	}
+}

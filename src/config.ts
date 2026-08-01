@@ -10,8 +10,14 @@ export interface ModelConfig {
   name: string;
   /** HuggingFace repo ID (for vllm/sglang) or absolute path to GGUF file (for llama-server) */
   modelPath: string;
-  /** Backend: "vllm" (default), "llama-server", "sglang", or "kestrel" */
-  backend?: "vllm" | "llama-server" | "sglang" | "kestrel";
+  /**
+   * Specific file to download from the HF repo (llama-server only).
+   * Use for GGUF repos that ship many quantizations — downloads just this
+   * file instead of the whole repo, e.g. "Qwythos-27B-Q4_K_M.gguf".
+   */
+  modelFile?: string;
+  /** Backend: "vllm" (default), "llama-server", or "sglang" */
+  backend?: "vllm" | "llama-server" | "sglang";
   /** GPU device index (single GPU) */
   gpu: number;
   /** GPU device indices for multi-GPU (tensor parallel). Overrides gpu if set. */
@@ -86,10 +92,70 @@ function getConfigPath(): string | null {
   return process.env.LLM_ROUTER_CONFIG || null;
 }
 
+const DEFAULT_IDLE_TIMEOUT_MS = 300000;
+
 function readConfigFile(configPath: string): ManagerConfig {
   const raw = readFileSync(configPath, "utf-8");
   const loaded = JSON.parse(raw) as Partial<ManagerConfig>;
   return { ...defaultConfig, ...loaded };
+}
+
+/**
+ * Reject a config we can't serve, loudly. Half-loading it means the router
+ * comes up healthy while quietly serving fewer models than the user wrote.
+ */
+function validateConfig(config: ManagerConfig): void {
+  const errors: string[] = [];
+
+  if (!Array.isArray(config.models)) {
+    throw new Error("config.models must be an array");
+  }
+
+  const names = new Set<string>();
+  for (const [i, model] of config.models.entries()) {
+    const label = model?.name ? `models[${i}] (${model.name})` : `models[${i}]`;
+
+    if (!model || typeof model !== "object") {
+      errors.push(`${label}: must be an object`);
+      continue;
+    }
+    if (!model.name || typeof model.name !== "string") {
+      errors.push(`${label}: "name" is required`);
+    } else if (names.has(model.name)) {
+      errors.push(`${label}: duplicate model name "${model.name}"`);
+    } else {
+      names.add(model.name);
+    }
+
+    if (!model.modelPath || typeof model.modelPath !== "string") {
+      errors.push(`${label}: "modelPath" is required`);
+    }
+    if (typeof model.gpu !== "number" || !Number.isInteger(model.gpu) || model.gpu < 0) {
+      errors.push(`${label}: "gpu" must be a non-negative integer`);
+    }
+    if (model.gpus && model.gpus.some((g) => typeof g !== "number")) {
+      errors.push(`${label}: "gpus" must be a list of numbers`);
+    }
+    if (model.idleTimeout === undefined) {
+      model.idleTimeout = DEFAULT_IDLE_TIMEOUT_MS;
+    } else if (typeof model.idleTimeout !== "number" || !(model.idleTimeout > 0)) {
+      errors.push(`${label}: "idleTimeout" must be a positive number of milliseconds`);
+    }
+  }
+
+  // Aliases are looked up in the same namespace as names, so a collision
+  // silently steals another model's traffic.
+  for (const model of config.models) {
+    for (const alias of model?.aliases ?? []) {
+      if (names.has(alias) && alias !== model.name) {
+        errors.push(`models (${model.name}): alias "${alias}" collides with another model's name`);
+      }
+    }
+  }
+
+  if (errors.length > 0) {
+    throw new Error(`Invalid configuration:\n  - ${errors.join("\n  - ")}`);
+  }
 }
 
 /** Apply post-load defaults (startup timeout, idle timeout overrides) */
@@ -114,14 +180,21 @@ function applyDefaults(config: ManagerConfig): ManagerConfig {
 }
 
 export function loadConfig(): ManagerConfig {
-  let config = { ...defaultConfig };
   const configPath = getConfigPath();
-  if (configPath) {
-    try {
-      config = readConfigFile(configPath);
-    } catch (err) {
-      console.warn(`Failed to load config from ${configPath}, using defaults`, err);
-    }
+  if (!configPath) return applyDefaults({ ...defaultConfig });
+
+  let config: ManagerConfig;
+  try {
+    config = readConfigFile(configPath);
+    validateConfig(config);
+  } catch (err) {
+    console.error(`✗ Cannot load config from ${configPath}:`);
+    console.error(`  ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+
+  if (config.models.length === 0) {
+    console.warn(`⚠ ${configPath} declares no models — the router will serve nothing.`);
   }
 
   return applyDefaults(config);
@@ -129,42 +202,29 @@ export function loadConfig(): ManagerConfig {
 
 /**
  * Re-read config from disk, bypassing require cache.
- * Returns fresh ManagerConfig with all defaults applied.
+ * Returns fresh ManagerConfig with all defaults applied. Throws on a bad file:
+ * unlike boot, a bad reload must not take the running router down.
  */
 export function reloadConfig(): ManagerConfig {
-  let config = { ...defaultConfig };
   const configPath = getConfigPath();
-  if (configPath) {
-    try {
-      config = readConfigFile(configPath);
-      console.log(`[config] Reloaded config from ${configPath}`);
-    } catch (err) {
-      console.warn(`[config] Failed to reload from ${configPath}:`, err);
-    }
-  }
+  if (!configPath) return applyDefaults({ ...defaultConfig });
 
+  const config = readConfigFile(configPath);
+  validateConfig(config);
+  console.log(`[config] Reloaded config from ${configPath}`);
   return applyDefaults(config);
 }
 
 /**
  * Re-read config and return the ModelConfig for a specific model name.
- * Returns null if the model is not found in the reloaded config.
+ * Returns null if the model is not found or the file is unusable.
  */
 export function reloadModelConfig(modelName: string): ModelConfig | null {
-  const config = reloadConfig();
-  return config.models.find((m) => m.name === modelName) || null;
-}
-
-/** Build a lookup map: model name/alias -> ModelConfig */
-export function buildModelLookup(models: ModelConfig[]): Map<string, ModelConfig> {
-  const map = new Map<string, ModelConfig>();
-  for (const model of models) {
-    map.set(model.name, model);
-    if (model.aliases) {
-      for (const alias of model.aliases) {
-        map.set(alias, model);
-      }
-    }
+  try {
+    const config = reloadConfig();
+    return config.models.find((m) => m.name === modelName) || null;
+  } catch (err) {
+    console.warn(`[config] Failed to reload config:`, err instanceof Error ? err.message : err);
+    return null;
   }
-  return map;
 }
