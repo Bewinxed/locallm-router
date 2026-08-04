@@ -38,7 +38,11 @@ export interface ModelConfig {
   vramGB?: number;
   /** Eviction priority (default: 0). Higher = harder to evict. Models with equal priority use LRU. */
   priority?: number;
-  /** Delay in ms after idle timeout before sleeping/stopping. 0 = immediate. Default: 0 */
+  /**
+   * Delay in ms after idle timeout before sleeping/stopping. 0 = immediate.
+   * Unset defaults to 60000 for backends that support sleep (vLLM) and 0 for
+   * the rest, so a model isn't slept — and woken — between two requests.
+   */
   sleepDelay?: number;
   /** Aliases: additional model names that route to this model */
   aliases?: string[];

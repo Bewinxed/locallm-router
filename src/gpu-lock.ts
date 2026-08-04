@@ -15,6 +15,7 @@ import {
   formatEstimate,
   getGpuMemoryUtil,
   resolveEstimate,
+  type ComputeApp,
   type ModelSizeEstimate,
 } from "./model-size";
 import { MODELS_DIR } from "./download";
@@ -25,11 +26,40 @@ export interface GpuOwner {
   readonly gpu: number;
   readonly gpus?: number[];
   readonly config: ModelConfig;
-  isRunning(): boolean;
+  /**
+   * True while the backend process exists — starting, serving, asleep or on
+   * its way out. All of those hold VRAM, so all of them keep their
+   * reservation; only a process that is actually gone has a stale one.
+   */
+  isAlive(): boolean;
   stopProcess(): Promise<void>;
   /** Pids of the backend's process group; empty when it isn't running. */
   pids(): number[];
 }
+
+/** Everything the scheduler reads from the driver about one card, in one shot. */
+export interface GpuReading {
+  name: string;
+  totalMB: number;
+  usedMB: number;
+  /** Per-process rows for this card only. */
+  computeApps: ComputeApp[];
+}
+
+/** Null when the driver doesn't report the card at all. */
+export type GpuProbe = (gpu: number) => Promise<GpuReading | null>;
+
+const nvidiaProbe: GpuProbe = async (gpu) => {
+  const [gpus, apps] = await Promise.all([getGpuInfo(), getComputeApps()]);
+  const info = gpus.find((g) => g.index === gpu);
+  if (!info) return null;
+  return {
+    name: info.name,
+    totalMB: info.totalMemoryMB,
+    usedMB: info.usedMemoryMB,
+    computeApps: apps.filter((a) => a.gpu === gpu),
+  };
+};
 
 interface LoadedModel {
   owner: GpuOwner;
@@ -37,7 +67,14 @@ interface LoadedModel {
   observedVRAM: number | null;
   loadedAt: number;
   lastActivity: number;
+  /** Asleep but still resident: the backend lives, its weights don't. */
+  sleeping: boolean;
+  /** What it still holds here while asleep; null when we couldn't measure. */
+  sleepingVRAM: number | null;
 }
+
+/** Undoes one acquisition, for when a sibling card refuses the same model. */
+type Rollback = () => void;
 
 interface EvictionRecord {
   modelName: string;
@@ -132,12 +169,15 @@ function persistObservedVRAM(modelName: string, gb: number, perProcess: boolean)
   return true;
 }
 
-class GpuScheduler {
+export class GpuScheduler {
   readonly gpu: number;
+  private readonly probe: GpuProbe;
   private totalVRAM: number = 0;
   private initialized = false;
   private initPromise: Promise<void> | null = null;
   private loaded = new Map<string, LoadedModel>();
+  /** Every model configured for this card, resident or not — see otherUsage. */
+  private owners = new Map<string, GpuOwner>();
   private estimates = new Map<string, ModelSizeEstimate>();
   private estimateRefresh = new Map<string, Promise<void>>();
   private recentEvictions: EvictionRecord[] = [];
@@ -150,8 +190,9 @@ class GpuScheduler {
   private static readonly RECONCILE_INTERVAL_MS = 5000;
   private static readonly OTHER_USAGE_TTL_MS = 5000;
 
-  constructor(gpu: number) {
+  constructor(gpu: number, probe: GpuProbe = nvidiaProbe) {
     this.gpu = gpu;
+    this.probe = probe;
   }
 
   initialize(): Promise<void> {
@@ -160,11 +201,10 @@ class GpuScheduler {
   }
 
   private async readTotalVRAM(): Promise<void> {
-    const gpus = await getGpuInfo();
-    const gpuInfo = gpus.find((g) => g.index === this.gpu);
-    if (gpuInfo) {
-      this.totalVRAM = gpuInfo.totalMemoryMB / 1024;
-      console.log(`[gpu-lock] GPU ${this.gpu}: ${gpuInfo.name}, ${this.totalVRAM.toFixed(1)}GB total`);
+    const reading = await this.probe(this.gpu);
+    if (reading) {
+      this.totalVRAM = reading.totalMB / 1024;
+      console.log(`[gpu-lock] GPU ${this.gpu}: ${reading.name}, ${this.totalVRAM.toFixed(1)}GB total`);
     } else {
       this.totalVRAM = 24;
       console.log(`[gpu-lock] GPU ${this.gpu}: Unknown (assuming 24GB)`);
@@ -177,6 +217,7 @@ class GpuScheduler {
   }
 
   registerModel(owner: GpuOwner): void {
+    this.owners.set(owner.name, owner);
     this.setEstimate(owner, estimateVRAM(owner.config));
     void this.ensureEstimate(owner);
     void this.warnIfWeightsExceedPrealloc(owner);
@@ -287,7 +328,13 @@ class GpuScheduler {
     return Math.max(observedGB ?? estimateGB, this.preallocFloor(config));
   }
 
+  /**
+   * A sleeping model is held to what it actually still occupies, not to its
+   * running footprint or vLLM's prealloc floor — the weights are in host RAM
+   * and that memory is genuinely available to everyone else.
+   */
   private getModelVRAM(model: LoadedModel): number {
+    if (model.sleeping && model.sleepingVRAM !== null) return model.sleepingVRAM;
     return this.footprint(model.owner.config, model.estimate.totalVRAM, model.observedVRAM);
   }
 
@@ -313,17 +360,16 @@ class GpuScheduler {
     if (now - this.lastReconcileTime < GpuScheduler.RECONCILE_INTERVAL_MS) return;
     this.lastReconcileTime = now;
 
-    const gpus = await getGpuInfo();
-    const gpuInfo = gpus.find((g) => g.index === this.gpu);
-    if (!gpuInfo) return;
+    const reading = await this.probe(this.gpu);
+    if (!reading) return;
 
-    const actualUsedGB = gpuInfo.usedMemoryMB / 1024;
+    const actualUsedGB = reading.usedMB / 1024;
     const estimatedUsedGB = this.getEstimatedVRAM();
 
     if (estimatedUsedGB > 2 && actualUsedGB < estimatedUsedGB - 2) {
       let removedAny = false;
       for (const [name, model] of this.loaded) {
-        if (!model.owner.isRunning()) {
+        if (!model.owner.isAlive()) {
           console.log(`[gpu-lock] GPU ${this.gpu}: removing stale entry ${name} (est=${estimatedUsedGB.toFixed(1)}GB, actual=${actualUsedGB.toFixed(1)}GB)`);
           this.loaded.delete(name);
           removedAny = true;
@@ -341,15 +387,39 @@ class GpuScheduler {
    * VRAM held on this card by processes the router didn't start — a desktop
    * session is several GB on GPU 0 here. Accounting alone can't see it, so
    * without this the scheduler hands the same memory out twice.
+   *
+   * What is ours is decided by asking the driver which pids hold what, not by
+   * our own bookkeeping: a backend the scheduler has stopped tracking is still
+   * the router's memory, and taxing ourselves for it is how a sleeping model
+   * ends up unable to afford its own wake.
    */
   private async refreshOtherUsage(): Promise<void> {
     const now = Date.now();
     if (now - this.otherUsageAt < GpuScheduler.OTHER_USAGE_TTL_MS) return;
     this.otherUsageAt = now;
 
-    const gpuInfo = (await getGpuInfo()).find((g) => g.index === this.gpu);
-    if (!gpuInfo) return;
-    this.otherUsageGB = Math.max(0, gpuInfo.usedMemoryMB / 1024 - this.getEstimatedVRAM());
+    const reading = await this.probe(this.gpu);
+    if (!reading) return;
+    const oursGB = this.routerOwnedVRAM(reading.computeApps) ?? this.getEstimatedVRAM();
+    this.otherUsageGB = Math.max(0, reading.usedMB / 1024 - oursGB);
+  }
+
+  /**
+   * Per-process VRAM held here by backends the router started, awake or
+   * asleep. Null when the driver accounts for none of them: a Vulkan build of
+   * llama.cpp holds real memory and never appears in these rows, and reading
+   * that as zero would declare the whole card foreign.
+   */
+  private routerOwnedVRAM(apps: ComputeApp[]): number | null {
+    const pids = new Set<number>();
+    for (const owner of this.owners.values()) {
+      for (const pid of owner.pids()) pids.add(pid);
+    }
+    if (pids.size === 0) return null;
+
+    const rows = apps.filter((a) => pids.has(a.pid));
+    if (rows.length === 0) return null;
+    return rows.reduce((sum, a) => sum + a.usedMemoryMB, 0) / 1024;
   }
 
   /** Room left on the card for a model that isn't resident yet. */
@@ -359,9 +429,23 @@ class GpuScheduler {
 
   /** Snapshot current GPU memory usage (call before model start) */
   async snapshotVRAM(): Promise<number> {
-    const gpus = await getGpuInfo();
-    const gpuInfo = gpus.find((g) => g.index === this.gpu);
-    return gpuInfo ? gpuInfo.usedMemoryMB / 1024 : 0;
+    const reading = await this.probe(this.gpu);
+    return reading ? reading.usedMB / 1024 : 0;
+  }
+
+  /**
+   * What this model's own processes hold on this card right now, per the
+   * driver. Null when it has no pids here, or none the driver accounts for.
+   */
+  private async measureResident(owner: GpuOwner): Promise<number | null> {
+    const pids = new Set(owner.pids());
+    if (pids.size === 0) return null;
+
+    const reading = await this.probe(this.gpu);
+    if (!reading) return null;
+    const rows = reading.computeApps.filter((a) => pids.has(a.pid));
+    if (rows.length === 0) return null;
+    return rows.reduce((sum, a) => sum + a.usedMemoryMB, 0) / 1024;
   }
 
   /**
@@ -376,14 +460,9 @@ class GpuScheduler {
     owner: GpuOwner,
     preSnapshotGB: number
   ): Promise<{ gb: number; perProcess: boolean }> {
-    const pids = new Set(owner.pids());
-    if (pids.size > 0) {
-      const rows = (await getComputeApps()).filter((a) => a.gpu === this.gpu && pids.has(a.pid));
-      if (rows.length > 0) {
-        const usedMB = rows.reduce((sum, a) => sum + a.usedMemoryMB, 0);
-        return { gb: usedMB / 1024, perProcess: true };
-      }
-    }
+    const perProcessGB = await this.measureResident(owner);
+    if (perProcessGB !== null) return { gb: perProcessGB, perProcess: true };
+
     const postGB = await this.snapshotVRAM();
     return { gb: Math.max(0, postGB - preSnapshotGB), perProcess: false };
   }
@@ -435,10 +514,22 @@ class GpuScheduler {
     return record ? ANTI_THRASH_COOLDOWN_MS - (now - record.evictedAt) : 0;
   }
 
+  /**
+   * VRAM this model still has to find here. A sleeping model is already a
+   * resident holding its CUDA context, so waking it only has to cover the
+   * difference between that and its running footprint.
+   */
+  private additionalVRAM(owner: GpuOwner): number {
+    const resident = this.loaded.get(owner.name);
+    const heldGB = resident ? this.getModelVRAM(resident) : 0;
+    return Math.max(0, this.expectedVRAM(owner) - heldGB);
+  }
+
   /** True when this model can only be loaded by evicting something else. */
   needsEviction(owner: GpuOwner): boolean {
-    if (this.loaded.has(owner.name)) return false;
-    return this.expectedVRAM(owner) > this.getAvailableVRAM();
+    const resident = this.loaded.get(owner.name);
+    if (resident && !resident.sleeping) return false;
+    return this.additionalVRAM(owner) > this.getAvailableVRAM();
   }
 
   private recordEviction(modelName: string): void {
@@ -466,9 +557,9 @@ class GpuScheduler {
 
   /** Fail loudly with the numbers, so "it didn't fit" is never a mystery. */
   private cannotFitError(owner: GpuOwner, needVRAM: number): InsufficientVRAMError {
-    const residents = [...this.loaded.values()]
-      .filter((m) => m.owner.name !== owner.name)
-      .map((m) => `${m.owner.name} ${this.getModelVRAM(m).toFixed(1)}GB`);
+    const residents = [...this.loaded.values()].map(
+      (m) => `${m.owner.name} ${this.getModelVRAM(m).toFixed(1)}GB${m.sleeping ? " (sleeping)" : ""}`
+    );
     return new InsufficientVRAMError(
       `Cannot fit ${owner.name} (${needVRAM.toFixed(1)}GB) on GPU ${this.gpu}: ` +
         `${this.totalVRAM.toFixed(1)}GB total, ${VRAM_HEADROOM_GB.toFixed(1)}GB headroom, ` +
@@ -486,9 +577,10 @@ class GpuScheduler {
     await this.initialize();
     await this.ensureEstimate(owner);
     await this.refreshOtherUsage();
-    if (this.loaded.has(owner.name)) return;
+    const resident = this.loaded.get(owner.name);
+    if (resident && !resident.sleeping) return;
 
-    const needVRAM = this.expectedVRAM(owner);
+    const needVRAM = this.additionalVRAM(owner);
     const available = this.getAvailableVRAM();
     if (needVRAM <= available) return;
 
@@ -501,9 +593,11 @@ class GpuScheduler {
 
   /**
    * Reserve VRAM for a model, evicting others if needed. Serialized: a second
-   * caller waits rather than racing the first one's eviction.
+   * caller waits rather than racing the first one's eviction. Resolves with an
+   * undo for the reservation, which a multi-GPU acquire needs when a later
+   * card turns the same model down.
    */
-  acquire(owner: GpuOwner): Promise<void> {
+  acquire(owner: GpuOwner): Promise<Rollback> {
     const run = this.queue.then(
       () => this.acquireLocked(owner),
       () => this.acquireLocked(owner)
@@ -512,13 +606,14 @@ class GpuScheduler {
     return run;
   }
 
-  private async acquireLocked(owner: GpuOwner): Promise<void> {
+  private async acquireLocked(owner: GpuOwner): Promise<Rollback> {
     await this.initialize();
     await this.reconcileWithGpu();
 
-    if (this.loaded.has(owner.name)) {
-      this.loaded.get(owner.name)!.lastActivity = Date.now();
-      return;
+    const resident = this.loaded.get(owner.name);
+    if (resident && !resident.sleeping) {
+      resident.lastActivity = Date.now();
+      return () => {};
     }
 
     await this.ensureEstimate(owner);
@@ -526,7 +621,7 @@ class GpuScheduler {
 
     const estimate = this.estimates.get(owner.name);
     if (!estimate) throw new Error(`Model ${owner.name} not registered`);
-    const needVRAM = this.expectedVRAM(owner);
+    const needVRAM = this.additionalVRAM(owner);
     const available = this.getAvailableVRAM();
 
     // Coexistence first: only what the resident models actually hold is off
@@ -539,14 +634,17 @@ class GpuScheduler {
     }
 
     // Reserve before evicting: the slot is ours for the whole (slow) eviction,
-    // and the victims can't pick it back up on their way out.
-    this.reserve(owner, estimate);
+    // and the victims can't pick it back up on their way out. Waking is a
+    // reservation too — the model goes back to its full footprint here for the
+    // whole wake, not once it finishes.
+    const rollback = this.reserve(owner, estimate, resident);
 
     if (toEvict.length === 0) {
       console.log(
-        `[gpu-lock] GPU ${this.gpu}: ${owner.name} fits (need ${needVRAM.toFixed(1)}GB, have ${available.toFixed(1)}GB)`
+        `[gpu-lock] GPU ${this.gpu}: ${owner.name} ${resident ? "wakes" : "fits"} ` +
+          `(need ${needVRAM.toFixed(1)}GB, have ${available.toFixed(1)}GB)`
       );
-      return;
+      return rollback;
     }
 
     console.log(
@@ -566,19 +664,44 @@ class GpuScheduler {
     // An eviction that failed leaves the incoming model without the room it was
     // promised; starting it anyway just OOMs the card.
     if (this.getAvailableVRAM() < 0) {
-      this.loaded.delete(owner.name);
+      rollback();
       throw this.cannotFitError(owner, needVRAM);
     }
+
+    return rollback;
   }
 
-  private reserve(owner: GpuOwner, estimate: ModelSizeEstimate): void {
+  /**
+   * Take the model's full footprint here. `asleep` is its existing residency
+   * when this is a wake rather than a cold start, and the rollback puts that
+   * residency back — its processes are alive either way.
+   */
+  private reserve(
+    owner: GpuOwner,
+    estimate: ModelSizeEstimate,
+    asleep?: LoadedModel
+  ): Rollback {
+    if (asleep) {
+      const sleepingVRAM = asleep.sleepingVRAM;
+      asleep.sleeping = false;
+      asleep.sleepingVRAM = null;
+      asleep.lastActivity = Date.now();
+      return () => {
+        asleep.sleeping = true;
+        asleep.sleepingVRAM = sleepingVRAM;
+      };
+    }
+
     this.loaded.set(owner.name, {
       owner,
       estimate,
       observedVRAM: observedVRAM.get(owner.name)?.gb ?? null,
       loadedAt: Date.now(),
       lastActivity: Date.now(),
+      sleeping: false,
+      sleepingVRAM: null,
     });
+    return () => this.loaded.delete(owner.name);
   }
 
   touchActivity(owner: GpuOwner): void {
@@ -588,6 +711,30 @@ class GpuScheduler {
 
   notifyStopped(owner: GpuOwner): void {
     this.loaded.delete(owner.name);
+  }
+
+  /**
+   * A model that went to sleep stays resident. vLLM's sleep level 1 offloads
+   * the weights to host RAM but keeps the process — and its CUDA context —
+   * alive, so the card is still occupied; deregistering it here is what left
+   * that memory looking like somebody else's.
+   */
+  async notifySleeping(owner: GpuOwner): Promise<void> {
+    const model = this.loaded.get(owner.name);
+    if (!model) return;
+
+    const heldGB = await this.measureResident(owner);
+    model.sleeping = true;
+    model.sleepingVRAM = heldGB;
+    // The card just changed underneath us; the cached split is stale.
+    this.otherUsageAt = 0;
+
+    console.log(
+      `[gpu-lock] GPU ${this.gpu}: ${owner.name} asleep, still holding ` +
+        (heldGB === null
+          ? `an unmeasured share — keeping its ${this.getModelVRAM(model).toFixed(1)}GB reservation`
+          : `${heldGB.toFixed(1)}GB here`)
+    );
   }
 
   async getStatus() {
@@ -605,6 +752,7 @@ class GpuScheduler {
         effectiveVRAM: this.getModelVRAM(m),
         priority: m.owner.config.priority ?? 0,
         lastActivity: m.lastActivity,
+        sleeping: m.sleeping,
       })),
     };
   }
@@ -612,6 +760,11 @@ class GpuScheduler {
 
 export class GpuLock {
   private schedulers = new Map<number, GpuScheduler>();
+  private readonly probe: GpuProbe;
+
+  constructor(probe: GpuProbe = nvidiaProbe) {
+    this.probe = probe;
+  }
 
   /** Number of GPUs the driver reported at boot. */
   get gpuCount(): number {
@@ -623,7 +776,7 @@ export class GpuLock {
     console.log(`[gpu-lock] Detected ${gpus.length} GPU(s)`);
     for (const gpu of gpus) {
       if (this.schedulers.has(gpu.index)) continue;
-      const scheduler = new GpuScheduler(gpu.index);
+      const scheduler = new GpuScheduler(gpu.index, this.probe);
       await scheduler.initialize();
       this.schedulers.set(gpu.index, scheduler);
     }
@@ -640,7 +793,7 @@ export class GpuLock {
   private schedulerFor(gpuIdx: number): GpuScheduler {
     let scheduler = this.schedulers.get(gpuIdx);
     if (!scheduler) {
-      scheduler = new GpuScheduler(gpuIdx);
+      scheduler = new GpuScheduler(gpuIdx, this.probe);
       this.schedulers.set(gpuIdx, scheduler);
     }
     return scheduler;
@@ -653,15 +806,14 @@ export class GpuLock {
   }
 
   async acquire(owner: GpuOwner): Promise<void> {
-    const acquired: GpuScheduler[] = [];
+    const rollbacks: Rollback[] = [];
     for (const gpuIdx of this.gpuIndices(owner)) {
       const scheduler = this.schedulerFor(gpuIdx);
       try {
-        await scheduler.acquire(owner);
-        acquired.push(scheduler);
+        rollbacks.push(await scheduler.acquire(owner));
       } catch (err) {
         // Partial multi-GPU acquisition helps nobody: hand back what we took.
-        for (const held of acquired) held.notifyStopped(owner);
+        for (const rollback of rollbacks) rollback();
         throw err;
       }
     }
@@ -721,6 +873,13 @@ export class GpuLock {
   notifyStopped(owner: GpuOwner): void {
     for (const gpuIdx of this.gpuIndices(owner)) {
       this.schedulers.get(gpuIdx)?.notifyStopped(owner);
+    }
+  }
+
+  /** Keep a sleeping model resident, at what its backend still holds per card. */
+  async notifySleeping(owner: GpuOwner): Promise<void> {
+    for (const gpuIdx of this.gpuIndices(owner)) {
+      await this.schedulers.get(gpuIdx)?.notifySleeping(owner);
     }
   }
 

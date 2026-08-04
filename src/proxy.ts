@@ -180,6 +180,18 @@ const RESTART_OVERRIDE_VALUE = /^[0-9.]+$/;
 /** Consecutive failed probes before a running backend is declared dead. */
 const HEALTH_FAILURES_BEFORE_STOP = 3;
 
+/**
+ * Grace between the idle timeout and sleeping a backend that can sleep. Waking
+ * costs a weight reload from host RAM, so a bare idleTimeout — which is what
+ * sleepDelay defaulting to 0 amounted to — makes every request after a quiet
+ * spell pay for it. An explicit 0 in the config still means sleep at once.
+ */
+const DEFAULT_SLEEP_DELAY_MS = 60_000;
+
+function sleepDelayFor(entry: ModelEntry): number {
+  return entry.config.sleepDelay ?? (entry.process.supportsSleep ? DEFAULT_SLEEP_DELAY_MS : 0);
+}
+
 function stripHeaders(headers: Headers, names: string[]): Headers {
   const out = new Headers(headers);
   for (const name of names) out.delete(name);
@@ -258,7 +270,7 @@ function makeGpuOwner(entry: ModelEntry): GpuOwner {
     gpu: entry.config.gpu,
     gpus: entry.config.gpus,
     config: entry.config,
-    isRunning: () => entry.process.status === "running",
+    isAlive: () => entry.process.status !== "stopped",
     stopProcess: () => entry.process.stop(),
     pids: () => entry.process.groupPids(),
   };
@@ -483,7 +495,7 @@ export class UnifiedProxy {
         const slept = await entry.process.sleep();
         if (slept) {
           this.clearIdleTimer(entry.config.name);
-          this.gpuLock.notifyStopped(makeGpuOwner(entry));
+          await this.gpuLock.notifySleeping(makeGpuOwner(entry));
           return;
         }
       }
@@ -1056,7 +1068,7 @@ export class UnifiedProxy {
         gpu: config.gpu,
         gpus: config.gpus,
         priority: config.priority ?? 0,
-        sleepDelay: config.sleepDelay ?? 0,
+        sleepDelay: sleepDelayFor(entry),
       };
     });
   }
@@ -1189,7 +1201,7 @@ export class UnifiedProxy {
         }
         const idleTime = Date.now() - entry.process.lastActivity;
         if (idleTime >= entry.config.idleTimeout && entry.process.status === "running") {
-          const sleepDelay = entry.config.sleepDelay ?? 0;
+          const sleepDelay = sleepDelayFor(entry);
           if (sleepDelay > 0) {
             console.log(
               `[${entry.config.name}] Idle for ${Math.round(idleTime / 1000 / 60)}min, sleep in ${sleepDelay / 1000}s...`
