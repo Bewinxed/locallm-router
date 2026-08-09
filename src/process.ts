@@ -86,6 +86,14 @@ interface BackendDescriptor {
   prepare?(): Promise<void>;
 }
 
+/**
+ * We pass --enable-sleep-mode to vLLM, but a config can turn it back off (the
+ * FP4 Marlin repack, for one, OOMs against the sleep allocator during load).
+ * /sleep still answers 200 in that case while freeing nothing, so such an entry
+ * has to be stopped on idle instead of slept.
+ */
+const SLEEP_DISABLED_ARG = "--no-enable-sleep-mode";
+
 function cudaDevices(config: ModelConfig): string {
   return config.gpus ? config.gpus.join(",") : config.gpu.toString();
 }
@@ -290,7 +298,9 @@ export class BackendProcess {
 
   get status(): ProcessStatus { return this.state; }
   get lastActivity(): number { return this.lastActivityAt; }
-  get supportsSleep(): boolean { return this.backend.supportsSleep; }
+  get supportsSleep(): boolean {
+    return this.backend.supportsSleep && !this.config.extraArgs?.includes(SLEEP_DISABLED_ARG);
+  }
 
   touchActivity(): void { this.lastActivityAt = Date.now(); }
   getConfig(): ModelConfig { return this.config; }
@@ -371,7 +381,7 @@ export class BackendProcess {
 
   /** Put the model to sleep (offload weights to CPU). vLLM only. */
   async sleep(): Promise<boolean> {
-    if (!this.backend.supportsSleep || this.state !== "running") return false;
+    if (!this.supportsSleep || this.state !== "running") return false;
     try {
       const r = await fetch(`${this.getInternalUrl()}/sleep`, {
         method: "POST",
