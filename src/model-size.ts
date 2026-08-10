@@ -597,6 +597,14 @@ export interface GpuInfo {
   freeMemoryMB: number;
 }
 
+/**
+ * nvidia-smi normally answers in milliseconds, but a contended driver can leave
+ * it blocked in the kernel for as long as it likes. This call sits inside the
+ * scheduler's admission path, where a read that never returns is a start that
+ * spawns nothing, logs nothing and never fails — so it gets a deadline.
+ */
+const NVIDIA_SMI_TIMEOUT_MS = 10_000;
+
 /** Run an nvidia-smi query, returning its CSV rows already split by column. */
 async function nvidiaSmi(query: string): Promise<string[][]> {
   try {
@@ -606,7 +614,26 @@ async function nvidiaSmi(query: string): Promise<string[][]> {
       stderr: "ignore",
     });
 
-    const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    let deadline: Timer | undefined;
+    const answered = await Promise.race([
+      Promise.all([new Response(proc.stdout).text(), proc.exited]),
+      new Promise<null>((resolve) => {
+        deadline = setTimeout(resolve, NVIDIA_SMI_TIMEOUT_MS, null);
+      }),
+    ]).finally(() => clearTimeout(deadline));
+
+    if (!answered) {
+      // Best effort: something stuck in the driver sits in uninterruptible
+      // sleep and leaves only when the kernel lets it, SIGKILL or not.
+      proc.kill("SIGKILL");
+      console.error(
+        `[model-size] nvidia-smi ${query} did not answer within ` +
+          `${NVIDIA_SMI_TIMEOUT_MS / 1000}s — giving up on this reading`
+      );
+      return [];
+    }
+
+    const [stdout, exitCode] = answered;
     if (exitCode !== 0) {
       console.error(`[model-size] nvidia-smi ${query} failed`);
       return [];
