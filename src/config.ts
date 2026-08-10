@@ -16,8 +16,8 @@ export interface ModelConfig {
    * file instead of the whole repo, e.g. "Qwythos-27B-Q4_K_M.gguf".
    */
   modelFile?: string;
-  /** Backend: "vllm" (default), "llama-server", or "sglang" */
-  backend?: "vllm" | "llama-server" | "sglang";
+  /** Backend: "vllm" (default), "llama-server", "sglang", or "parakeet-asr" */
+  backend?: "vllm" | "llama-server" | "sglang" | "parakeet-asr";
   /** GPU device index (single GPU) */
   gpu: number;
   /** GPU device indices for multi-GPU (tensor parallel). Overrides gpu if set. */

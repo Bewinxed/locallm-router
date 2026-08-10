@@ -23,6 +23,7 @@
 	},
 	"files": [
 		"src",
+		"servers",
 		"dashboard/build",
 		"config.example.json",
 		"README.md"

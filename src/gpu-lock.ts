@@ -549,8 +549,12 @@ export class GpuScheduler {
     let freedVRAM = 0;
     for (const model of candidates) {
       if (freedVRAM >= neededVRAM) break;
+      // A model that holds nothing here — a CPU-only sidecar registered on this
+      // card — hands back nothing when stopped, so evicting it is pure loss.
+      const modelVRAM = this.getModelVRAM(model);
+      if (modelVRAM <= 0) continue;
       toEvict.push(model);
-      freedVRAM += this.getModelVRAM(model);
+      freedVRAM += modelVRAM;
     }
     return toEvict;
   }

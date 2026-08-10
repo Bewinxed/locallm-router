@@ -98,6 +98,11 @@ class FakeBackend {
     this.live = true;
   }
 
+  /** Running, but on the CPU: the driver has never heard of it. */
+  runsOffCard(): void {
+    this.live = true;
+  }
+
   stop(): void {
     for (const gpu of this.gpus()) this.driver.release(gpu, this.pidBase + gpu);
     this.live = false;
@@ -287,5 +292,69 @@ describe("GpuScheduler admission", () => {
       "Cannot fit incoming-20b (20.0GB) on GPU 0: 24.0GB total, 1.0GB headroom, " +
         "4.5GB used outside the router, resident: resident-27b 17.9GB"
     );
+  });
+
+  test("a CPU-only sidecar is not evicted to make room — it holds nothing to give back", async () => {
+    const driver = new FakeDriver([0]);
+    const lock = new GpuLock(driver.probe);
+
+    const sidecar = new FakeBackend(
+      {
+        name: "parakeet",
+        modelPath: "/models/parakeet-tdt",
+        backend: "parakeet-asr",
+        gpu: 0,
+        idleTimeout: 300_000,
+        parameterCount: 0.6,
+        vramGB: 0,
+        extraArgs: ["--device", "cpu"],
+      },
+      driver,
+      1000
+    );
+    const resident = new FakeBackend(
+      {
+        name: "resident-27b",
+        modelPath: "/models/resident-27b-awq",
+        backend: "vllm",
+        gpu: 0,
+        idleTimeout: 600_000,
+        vramGB: 17.9,
+        extraArgs: ["--gpu-memory-utilization", "0.70"],
+      },
+      driver,
+      2000
+    );
+    const incoming = new FakeBackend(
+      {
+        name: "incoming-27b",
+        modelPath: "/models/incoming-27b-awq",
+        backend: "vllm",
+        gpu: 0,
+        idleTimeout: 600_000,
+        vramGB: 17.9,
+        extraArgs: ["--gpu-memory-utilization", "0.70"],
+      },
+      driver,
+      3000
+    );
+
+    lock.register(sidecar.owner);
+    lock.register(resident.owner);
+    lock.register(incoming.owner);
+
+    // The sidecar goes first, so LRU order offers it up before the 27B.
+    await lock.acquire(sidecar.owner);
+    sidecar.runsOffCard();
+    await lock.acquire(resident.owner);
+    resident.holds(AWAKE_MB);
+
+    await lock.acquire(incoming.owner);
+
+    expect(resident.owner.isAlive()).toBe(false);
+    expect(sidecar.owner.isAlive()).toBe(true);
+
+    const status = await lock.status();
+    expect(status[0].loaded.map((m) => m.name)).toEqual(["parakeet", "incoming-27b"]);
   });
 });

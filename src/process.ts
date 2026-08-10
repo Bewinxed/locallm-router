@@ -1,8 +1,9 @@
 /**
  * Process Manager — starts, supervises and stops backend inference servers.
  *
- * One class drives every backend; what differs between vLLM, llama-server and
- * SGLang (binary, args, env, ready log, health path) lives in BACKENDS.
+ * One class drives every backend; what differs between vLLM, llama-server,
+ * SGLang and the parakeet ASR sidecar (binary, args, env, ready log, health
+ * path) lives in BACKENDS.
  *
  * Two invariants the rest of the router depends on:
  *   - stdout/stderr are drained for the whole life of the child. A pipe nobody
@@ -122,6 +123,13 @@ function ncclEnv(config: ModelConfig): Record<string, string> {
 }
 
 /**
+ * The parakeet sidecar runs in its own venv: nothing else here needs
+ * Transformers, and ~/vllm-env must not be perturbed to add it.
+ */
+const PARAKEET_PYTHON = process.env.PARAKEET_PYTHON || `${process.env.HOME}/parakeet-env/bin/python`;
+const PARAKEET_SERVER = new URL("../servers/parakeet_server.py", import.meta.url).pathname;
+
+/**
  * Whether the installed llama-server understands --fit-ctx. Probed once, on
  * the first launch: an older build errors out on an unknown flag, and a
  * working setup must not break because we added a guard to it.
@@ -239,6 +247,27 @@ const BACKENDS: Record<string, BackendDescriptor> = {
       text.includes("The server is fired up") ||
       text.includes("Uvicorn running") ||
       text.includes("Application startup complete"),
+  },
+
+  "parakeet-asr": {
+    label: "parakeet",
+    binary: PARAKEET_PYTHON,
+    healthPath: "/health",
+    supportsSleep: false,
+    buildArgs: (config, port) => [
+      PARAKEET_SERVER,
+      "--model", config.modelPath,
+      "--port", port.toString(),
+      "--host", "127.0.0.1",
+      ...(config.extraArgs || []),
+    ],
+    // "gpu" is mandatory in every entry, but a `--device cpu` parakeet never
+    // touches the card it names — such an entry belongs with vramGB 0 so the
+    // scheduler doesn't reserve VRAM it will not use.
+    buildEnv: (config) => ({
+      CUDA_VISIBLE_DEVICES: cudaDevices(config),
+    }),
+    isReadyLog: (text) => text.includes("parakeet server listening"),
   },
 };
 
