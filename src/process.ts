@@ -306,9 +306,9 @@ export class BackendProcess {
   private startPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
   /**
-   * Set the moment a stop is asked for. A model evicted between start() and
-   * the spawn would otherwise finish launching into VRAM that has already been
-   * promised to someone else.
+   * Set the moment a stop is asked for, and cleared as each launch begins. A
+   * model evicted between there and the spawn would otherwise finish launching
+   * into VRAM that has already been promised to someone else.
    */
   private stopRequested = false;
   /** Set while a startup is in flight: fed by the log drain, settled by exits. */
@@ -359,7 +359,6 @@ export class BackendProcess {
     // A stop already in flight — an eviction, say — owns the port until it
     // finishes; spawning into it would leave two backends fighting over it.
     if (this.stopPromise) await this.stopPromise.catch(() => {});
-    this.stopRequested = false;
     if (this.state === "sleeping") {
       if (await this.wake()) return;
       await this.stop();
@@ -456,6 +455,10 @@ export class BackendProcess {
   // ─── Startup ──────────────────────────────────────────────
 
   private async launch(): Promise<void> {
+    // The flag has to start clear, and this is the first point at which it can:
+    // getting here can mean stopping the model ourselves — a wake that failed
+    // leaves it set — and that stop is not the eviction we are watching for.
+    this.stopRequested = false;
     await this.claimPort();
     await this.backend.prepare?.();
 
@@ -527,6 +530,9 @@ export class BackendProcess {
       `[${this.config.name}] Port ${this.internalPort} still held by our pid ${holder}, stopping it first`
     );
     await this.stop();
+    // Same reasoning as in launch(): we asked for that stop, so it must not be
+    // the thing that aborts the launch which asked for it.
+    this.stopRequested = false;
 
     holder = await portListener(this.internalPort);
     if (holder !== null) {
