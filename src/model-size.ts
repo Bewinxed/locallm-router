@@ -1,9 +1,9 @@
 /**
  * Model Size Estimation for GPU Memory Planning
  *
- * Estimates are produced in trust order (see resolveEstimate): the GGUF header
- * — read from disk, or over HTTP range requests for a model that has not been
- * downloaded yet — then the configured vramGB, then a parameter-count
+ * Estimates are produced in trust order (see resolveEstimate): the configured
+ * vramGB, then the GGUF header — read from disk, or over HTTP range requests
+ * for a model that has not been downloaded yet — then a parameter-count
  * heuristic. Sizes are GiB throughout, matching what nvidia-smi reports.
  */
 
@@ -21,8 +21,8 @@ export interface ModelSizeEstimate {
   kvCacheGB: number;
   /** Total estimated VRAM in GB */
   totalVRAM: number;
-  /** Where the number came from, best first. */
-  confidence: "gguf-local" | "gguf-remote" | "manual" | "exact" | "inferred" | "unknown";
+  /** Which rung of the ladder supplied the number, most trusted first. */
+  confidence: "manual" | "gguf-local" | "gguf-remote" | "exact" | "inferred" | "unknown";
 }
 
 const GIB = 1024 ** 3;
@@ -505,12 +505,24 @@ function ggufEstimate(
 }
 
 /**
- * VRAM this model needs, from the best source available: the GGUF header on
- * disk, the same header fetched from HuggingFace when the file isn't
- * downloaded yet, the configured vramGB, and finally the parameter-count
- * heuristic. The remote step is what lets admission run before a download.
+ * VRAM this model needs, from the best source available: the configured
+ * vramGB, then the GGUF header on disk, then the same header fetched from
+ * HuggingFace when the file isn't downloaded yet, and finally the
+ * parameter-count heuristic. The remote step is what lets admission run before
+ * a download.
+ *
+ * vramGB outranks the parsers because it is a human overruling them: it gets
+ * set precisely when an automatic estimate came out wrong, so letting an
+ * estimate win would ignore the correction it exists to apply. The one thing
+ * that does outrank it is a measurement, and that is applied a rung above this
+ * function — in the scheduler's footprint(), which prefers what the driver saw
+ * this model take over anything predicted here.
  */
 export async function resolveEstimate(config: ModelConfig): Promise<ModelSizeEstimate> {
+  if (config.vramGB !== undefined) {
+    return { ...estimateVRAM(config), totalVRAM: config.vramGB, confidence: "manual" };
+  }
+
   if (config.backend === "llama-server") {
     const localPath = resolveModelPath(config);
     const local = await cachedGgufShape(localPath, true);
@@ -522,11 +534,7 @@ export async function resolveEstimate(config: ModelConfig): Promise<ModelSizeEst
     }
   }
 
-  const estimate = estimateVRAM(config);
-  if (config.vramGB !== undefined) {
-    return { ...estimate, totalVRAM: config.vramGB, confidence: "manual" };
-  }
-  return estimate;
+  return estimateVRAM(config);
 }
 
 /** Repo weight sizes already fetched, keyed by repo id. */
