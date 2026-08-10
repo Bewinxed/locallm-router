@@ -179,7 +179,9 @@ const BACKENDS: Record<string, BackendDescriptor> = {
       "--host", "127.0.0.1",
       "--dtype", config.dtype || "bfloat16",
       "--served-model-name", config.name,
-      "--enable-sleep-mode",
+      // argparse takes the last flag, so passing both would still behave; it
+      // would just leave a command line that contradicts itself in the logs.
+      ...(config.extraArgs?.includes(SLEEP_DISABLED_ARG) ? [] : ["--enable-sleep-mode"]),
       ...(config.extraArgs || []),
     ],
     buildEnv: (config) => ({
