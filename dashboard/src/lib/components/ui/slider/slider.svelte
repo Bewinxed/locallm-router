@@ -21,31 +21,31 @@ get along, so we shut typescript up by casting `value` to `never`.
 	data-slot="slider"
 	{orientation}
 	class={cn(
-		"relative flex w-full touch-none items-center select-none data-[disabled]:opacity-50 data-[orientation=vertical]:h-full data-[orientation=vertical]:min-h-44 data-[orientation=vertical]:w-auto data-[orientation=vertical]:flex-col",
+		"data-vertical:min-h-40 relative flex w-full touch-none items-center select-none data-disabled:opacity-50 data-vertical:h-full data-vertical:w-auto data-vertical:flex-col",
 		className
 	)}
 	{...restProps}
 >
-	{#snippet children({ thumbs })}
+	{#snippet children({ thumbItems })}
 		<span
-			data-orientation={orientation}
 			data-slot="slider-track"
+			data-orientation={orientation}
 			class={cn(
-				"bg-muted relative grow overflow-hidden rounded-full data-[orientation=horizontal]:h-1.5 data-[orientation=horizontal]:w-full data-[orientation=vertical]:h-full data-[orientation=vertical]:w-1.5"
+				"rounded-4xl bg-muted data-horizontal:h-3 data-horizontal:w-full data-vertical:h-full data-vertical:w-3 relative grow overflow-hidden bg-muted data-horizontal:w-full data-vertical:h-full"
 			)}
 		>
 			<SliderPrimitive.Range
 				data-slot="slider-range"
 				class={cn(
-					"bg-primary absolute data-[orientation=horizontal]:h-full data-[orientation=vertical]:w-full"
+					"bg-primary absolute select-none data-horizontal:h-full data-vertical:w-full"
 				)}
 			/>
 		</span>
-		{#each thumbs as thumb (thumb)}
+		{#each thumbItems as thumb (thumb.index)}
 			<SliderPrimitive.Thumb
 				data-slot="slider-thumb"
-				index={thumb}
-				class="border-primary ring-ring/50 block size-4 shrink-0 rounded-full border bg-white shadow-sm transition-[color,box-shadow] hover:ring-4 focus-visible:ring-4 focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50"
+				index={thumb.index}
+				class="size-4 rounded-4xl border border-primary bg-white shadow-sm ring-ring/50 transition-colors hover:ring-4 focus-visible:ring-4 focus-visible:outline-hidden block shrink-0 select-none disabled:pointer-events-none disabled:opacity-50"
 			/>
 		{/each}
 	{/snippet}

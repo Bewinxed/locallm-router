@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        LLAMA_CPP_VERSION: b8180
+        LLAMA_CPP_VERSION: b10488
     container_name: locallm-router
     restart: unless-stopped
     ports:
@@ -13,9 +13,12 @@ services:
       - "${MANAGEMENT_PORT:-30099}:30099"
     volumes:
       - ${HF_HOME:-./models}:/models
-      - ./config.json:/app/config.json:ro
+      - ./config.json:/app/config.json
     environment:
       - LLM_ROUTER_CONFIG=/app/config.json
+      # The management port is loopback-only by default; in a container it has
+      # to listen on all interfaces to be reachable from the host.
+      - ROUTER_MGMT_HOST=0.0.0.0
       - HF_HOME=/models
       - HF_HUB_ENABLE_HF_TRANSFER=1
       - HF_TOKEN=${HF_TOKEN:-}

@@ -1,17 +1,23 @@
 import { createOpenAI } from '@ai-sdk/openai';
-import { streamText, type UIMessage, convertToModelMessages } from 'ai';
+import { convertToModelMessages, streamText, type UIMessage } from 'ai';
+import { proxyUrl } from '$lib/server/manager';
 import type { RequestHandler } from './$types';
 
-const openai = createOpenAI({
-	baseURL: 'http://localhost:30000/v1',
-	apiKey: 'not-needed',
-	// Long timeout: model loading can take 30-60s on first request
-	fetch: (url, init) => fetch(url, { ...init, signal: init?.signal ?? AbortSignal.timeout(300_000) })
-});
+const openai = createOpenAI({ baseURL: proxyUrl('/v1'), apiKey: 'not-needed' });
+
+/** A cold model may need to download and warm up before the first token. */
+const FIRST_TOKEN_TIMEOUT_MS = 300_000;
+
+export interface ChatMetadata {
+	inputTokens?: number;
+	outputTokens?: number;
+	totalTokens?: number;
+	finishReason?: string;
+	durationMs?: number;
+	tokensPerSecond?: number;
+}
 
 export const POST: RequestHandler = async ({ request }) => {
-	const body = await request.json();
-
 	const {
 		messages,
 		model,
@@ -22,9 +28,9 @@ export const POST: RequestHandler = async ({ request }) => {
 		maxTokens,
 		presencePenalty,
 		frequencyPenalty
-	} = body as {
+	} = (await request.json()) as {
 		messages: UIMessage[];
-		model: string;
+		model?: string;
 		system?: string;
 		temperature?: number;
 		topP?: number;
@@ -35,27 +41,43 @@ export const POST: RequestHandler = async ({ request }) => {
 	};
 
 	if (!model) {
-		return new Response(JSON.stringify({ error: 'No model specified' }), {
-			status: 400,
-			headers: { 'Content-Type': 'application/json' }
-		});
+		return Response.json({ error: 'No model specified' }, { status: 400 });
 	}
 
-	const modelMessages = await convertToModelMessages(messages);
+	const startedAt = Date.now();
 
-	// MUST use openai.chat() — openai() defaults to the Responses API (/v1/responses)
-	// which llama-server/vLLM don't support. .chat() forces Chat Completions API.
+	// openai() defaults to the Responses API (/v1/responses), which llama-server
+	// and vLLM do not implement. .chat() pins it to Chat Completions.
 	const result = streamText({
 		model: openai.chat(model),
-		system,
-		messages: modelMessages,
+		system: system || undefined,
+		messages: await convertToModelMessages(messages),
 		temperature,
 		topP,
 		topK,
 		maxOutputTokens: maxTokens,
 		presencePenalty,
-		frequencyPenalty
+		frequencyPenalty,
+		abortSignal: AbortSignal.timeout(FIRST_TOKEN_TIMEOUT_MS)
 	});
 
-	return result.toUIMessageStreamResponse();
+	return result.toUIMessageStreamResponse({
+		messageMetadata: ({ part }): ChatMetadata | undefined => {
+			if (part.type !== 'finish') return;
+			const durationMs = Date.now() - startedAt;
+			const outputTokens = part.totalUsage?.outputTokens;
+			return {
+				inputTokens: part.totalUsage?.inputTokens,
+				outputTokens,
+				totalTokens: part.totalUsage?.totalTokens,
+				finishReason: part.finishReason,
+				durationMs,
+				tokensPerSecond:
+					outputTokens && durationMs > 0
+						? Number((outputTokens / (durationMs / 1000)).toFixed(1))
+						: undefined
+			};
+		},
+		onError: (error) => (error instanceof Error ? error.message : 'Inference failed')
+	});
 };

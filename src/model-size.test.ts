@@ -108,6 +108,48 @@ describe("resolveEstimate", () => {
     expect(parsed.totalVRAM).not.toBe(19);
   });
 
+  /**
+   * A 284B freetoken model holds its weights in host RAM and caches hot experts
+   * on the card up to --memory-ratio. Sized like every other backend it would
+   * claim ~140GB of a 24GB GPU and never be schedulable again.
+   */
+  test("a freetoken model is sized by the card, not by its parameter count", async () => {
+    const config: ModelConfig = {
+      name: "edge-moe",
+      modelPath: "vendor/Some-MoE-284B",
+      backend: "freetoken",
+      gpu: 0,
+      idleTimeout: 600_000,
+      parameterCount: 284,
+    };
+
+    const estimate = await resolveEstimate(config);
+    const asWeights = await resolveEstimate({ ...config, backend: "vllm" });
+
+    expect(estimate.parametersBillions).toBe(284);
+    expect(estimate.weightsGB).toBe(0);
+    expect(asWeights.totalVRAM).toBeGreaterThan(500);
+    // The bound is a ratio of one card, so it can't be within an order of
+    // magnitude of the weights unless someone is running this on an SXM rack.
+    expect(estimate.totalVRAM).toBeGreaterThan(0);
+    expect(estimate.totalVRAM).toBeLessThan(asWeights.totalVRAM / 4);
+  });
+
+  test("vramGB still overrides the freetoken bound", async () => {
+    const estimate = await resolveEstimate({
+      name: "edge-moe",
+      modelPath: "vendor/Some-MoE-284B",
+      backend: "freetoken",
+      gpu: 0,
+      idleTimeout: 600_000,
+      parameterCount: 284,
+      vramGB: 12,
+    });
+
+    expect(estimate.totalVRAM).toBe(12);
+    expect(estimate.confidence).toBe("manual");
+  });
+
   test("falls back to the heuristic when there is no header and no override", async () => {
     const estimate = await resolveEstimate({
       ...ggufConfig(join(dir, "absent.gguf")),

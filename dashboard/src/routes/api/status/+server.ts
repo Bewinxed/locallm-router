@@ -1,80 +1,82 @@
 import { json } from '@sveltejs/kit';
+import { callUpstream, proxyUrl } from '$lib/server/manager';
+import type { DashboardData, GpuStats } from '$lib/types';
 import type { RequestHandler } from './$types';
-import type { GpuStats, ManagerStatus, DashboardData } from '$lib/types';
 
-const MANAGER_URL = 'http://localhost:30000/manager/status';
+const NVIDIA_SMI_FIELDS = [
+	'index',
+	'name',
+	'temperature.gpu',
+	'utilization.gpu',
+	'memory.used',
+	'memory.total',
+	'memory.free',
+	'power.draw',
+	'power.limit'
+] as const;
 
 function parseNvidiaSmi(output: string): GpuStats[] {
-	const lines = output.trim().split('\n').filter(Boolean);
-	return lines.map((line) => {
-		const parts = line.split(',').map((s) => s.trim());
-		return {
-			index: parseInt(parts[0], 10),
-			name: parts[1],
-			temperatureC: parseInt(parts[2], 10),
-			utilizationPercent: parseInt(parts[3], 10),
-			memoryUsedMB: parseInt(parts[4], 10),
-			memoryTotalMB: parseInt(parts[5], 10),
-			memoryFreeMB: parseInt(parts[6], 10),
-			powerDrawW: parseFloat(parts[7]),
-			powerLimitW: parseFloat(parts[8])
-		};
-	});
+	return output
+		.trim()
+		.split('\n')
+		.filter(Boolean)
+		.map((line) => {
+			const [index, name, temp, util, used, total, free, draw, limit] = line
+				.split(',')
+				.map((s) => s.trim());
+			return {
+				index: parseInt(index, 10),
+				name,
+				temperatureC: parseInt(temp, 10),
+				utilizationPercent: parseInt(util, 10),
+				memoryUsedMB: parseInt(used, 10),
+				memoryTotalMB: parseInt(total, 10),
+				memoryFreeMB: parseInt(free, 10),
+				powerDrawW: parseFloat(draw),
+				powerLimitW: parseFloat(limit)
+			};
+		})
+		.filter((gpu) => Number.isFinite(gpu.index));
 }
 
+/** Returns [] on any failure — a CPU-only host is a valid state, not an error. */
 async function getGpuStats(): Promise<GpuStats[]> {
 	try {
-		const proc = Bun.spawn([
-			'nvidia-smi',
-			'--query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,memory.free,power.draw,power.limit',
-			'--format=csv,noheader,nounits'
-		], {
-			stdout: 'pipe',
-			stderr: 'pipe'
-		});
+		const proc = Bun.spawn(
+			['nvidia-smi', `--query-gpu=${NVIDIA_SMI_FIELDS.join(',')}`, '--format=csv,noheader,nounits'],
+			{ stdout: 'pipe', stderr: 'ignore' }
+		);
 
-		const timeout = setTimeout(() => proc.kill(), 5000);
+		const kill = setTimeout(() => proc.kill(), 5000);
 		try {
-			const [stdout, exitCode] = await Promise.all([
-				new Response(proc.stdout).text(),
-				proc.exited
-			]);
-
-			if (exitCode !== 0) return [];
-			return parseNvidiaSmi(stdout);
+			const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+			return exitCode === 0 ? parseNvidiaSmi(stdout) : [];
 		} finally {
-			clearTimeout(timeout);
+			clearTimeout(kill);
 		}
 	} catch {
 		return [];
 	}
 }
 
-async function getManagerStatus(): Promise<ManagerStatus | null> {
-	try {
-		const res = await fetch(MANAGER_URL, {
-			signal: AbortSignal.timeout(5000)
-		});
-		if (!res.ok) return null;
-		return (await res.json()) as ManagerStatus;
-	} catch {
-		return null;
-	}
-}
-
 export const GET: RequestHandler = async () => {
-	const [managerStatus, gpuStats] = await Promise.all([getManagerStatus(), getGpuStats()]);
+	const [manager, gpuStats] = await Promise.all([
+		callUpstream(proxyUrl('/manager/status'), { timeoutMs: 5000 }),
+		getGpuStats()
+	]);
+
+	const managerData =
+		manager.ok && manager.status === 200 ? (manager.body as Partial<DashboardData>) : null;
 
 	const result: DashboardData = {
-		models: managerStatus?.models ?? [],
-		gpus: managerStatus?.gpus ?? {},
-		balanceGroups: managerStatus?.balanceGroups ?? [],
+		models: managerData?.models ?? [],
+		gpus: managerData?.gpus ?? {},
+		balanceGroups: managerData?.balanceGroups ?? [],
 		gpuStats
 	};
 
-	return json(result, {
-		headers: {
-			'Cache-Control': 'no-store'
-		}
-	});
+	// A reachable dashboard with an unreachable router should say so, rather
+	// than silently rendering an empty model list as if nothing is configured.
+	const status = managerData ? 200 : 502;
+	return json(result, { status, headers: { 'Cache-Control': 'no-store' } });
 };

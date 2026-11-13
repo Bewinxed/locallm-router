@@ -1,33 +1,35 @@
 <script lang="ts">
-	import CircleCheckIcon from "~icons/ph/check-circle";
-	import InfoIcon from "~icons/ph/info";
-	import Loader2Icon from "~icons/ph/spinner";
-	import OctagonXIcon from "~icons/ph/x-circle";
-	import TriangleAlertIcon from "~icons/ph/warning";
-
+	import { mode } from "mode-watcher";
 	import { Toaster as Sonner, type ToasterProps as SonnerProps } from "svelte-sonner";
+	import { HugeiconsIcon } from "@hugeicons/svelte"
+	import { Loading03Icon } from '@hugeicons/core-free-icons';
+	import { CheckmarkCircle02Icon } from '@hugeicons/core-free-icons';
+	import { MultiplicationSignCircleIcon } from '@hugeicons/core-free-icons';
+	import { InformationCircleIcon } from '@hugeicons/core-free-icons';
+	import { Alert02Icon } from '@hugeicons/core-free-icons';
 
 	let { ...restProps }: SonnerProps = $props();
 </script>
 
 <Sonner
-	theme="dark"
+	theme={mode.current}
 	class="toaster group"
 	style="--normal-bg: var(--color-popover); --normal-text: var(--color-popover-foreground); --normal-border: var(--color-border);"
 	{...restProps}
-	>{#snippet loadingIcon()}
-		<Loader2Icon class="size-4 animate-spin" />
+>
+	{#snippet loadingIcon()}
+		<HugeiconsIcon icon={Loading03Icon} strokeWidth={2} class="size-4 animate-spin" />
 	{/snippet}
 	{#snippet successIcon()}
-		<CircleCheckIcon class="size-4" />
+		<HugeiconsIcon icon={CheckmarkCircle02Icon} strokeWidth={2} class="size-4" />
 	{/snippet}
 	{#snippet errorIcon()}
-		<OctagonXIcon class="size-4" />
+		<HugeiconsIcon icon={MultiplicationSignCircleIcon} strokeWidth={2} class="size-4" />
 	{/snippet}
 	{#snippet infoIcon()}
-		<InfoIcon class="size-4" />
+		<HugeiconsIcon icon={InformationCircleIcon} strokeWidth={2} class="size-4" />
 	{/snippet}
 	{#snippet warningIcon()}
-		<TriangleAlertIcon class="size-4" />
+		<HugeiconsIcon icon={Alert02Icon} strokeWidth={2} class="size-4" />
 	{/snippet}
 </Sonner>

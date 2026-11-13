@@ -1,3 +1,5 @@
+export type ModelState = 'stopped' | 'starting' | 'running' | 'stopping' | 'sleeping';
+
 export interface GpuStats {
 	index: number;
 	name: string;
@@ -14,7 +16,7 @@ export interface ModelStatus {
 	name: string;
 	backend: string;
 	modelPath: string;
-	status: 'stopped' | 'starting' | 'running' | 'stopping' | 'sleeping';
+	status: ModelState;
 	lastActivity: number;
 	downloading: boolean;
 	downloadError: string | null;
@@ -34,36 +36,26 @@ export interface BalanceGroupStatus {
 
 export interface BalanceInstance {
 	gpu: number;
-	status: string;
+	status: ModelState;
 	inflight: number;
 	internalPort: number;
 	lastActivity: number;
 }
 
+/** VRAM figures from the GPU lock are gigabytes, unlike nvidia-smi's megabytes. */
 export interface GpuLockStatus {
 	totalVRAM: number;
 	usedVRAM: number;
 	availableVRAM: number;
-	loaded: { name: string; vram: number; lastActivity: number }[];
-}
-
-export interface ManagerStatus {
-	models: ModelStatus[];
-	gpus: Record<string, GpuLockStatus>;
-	balanceGroups: BalanceGroupStatus[];
-}
-
-export interface RequestLogEntry {
-	id: string;
-	timestamp: number;
-	model: string;
-	modifier: string | null;
-	targetGpu: number;
-	status: 'pending' | 'streaming' | 'complete' | 'error';
-	promptTokens?: number;
-	completionTokens?: number;
-	tokensPerSecond?: number;
-	durationMs?: number;
+	loaded: {
+		name: string;
+		estimatedVRAM: number;
+		observedVRAM: number | null;
+		/** Observed once measured, falling back to the estimate. */
+		effectiveVRAM: number;
+		priority: number;
+		lastActivity: number;
+	}[];
 }
 
 export interface DashboardData {
@@ -71,4 +63,22 @@ export interface DashboardData {
 	gpus: Record<string, GpuLockStatus>;
 	balanceGroups: BalanceGroupStatus[];
 	gpuStats: GpuStats[];
+}
+
+/** An entry from the router's OpenAI-compatible /v1/models listing. */
+export interface RouterModel {
+	id: string;
+	object: 'model';
+	owned_by: string;
+	root: string;
+	status: ModelState;
+	gpu: number[];
+	aliases: string[];
+	balance?: {
+		enabled: boolean;
+		gpus: number[];
+		/** Routable names, e.g. "qwen:balance", "qwen:gpu0" */
+		modifiers: string[];
+		instances: { gpu: number; status: ModelState }[];
+	};
 }

@@ -15,6 +15,17 @@
       ]
     },
     {
+      "name": "qwythos-27b",
+      "backend": "llama-server",
+      "modelPath": "empero-ai/Qwythos-27B-v1-GGUF",
+      "modelFile": "Qwythos-27B-Q4_K_M.gguf",
+      "parameterCount": 27,
+      "vramGB": 19,
+      "gpu": 0,
+      "idleTimeout": 600000,
+      "extraArgs": ["-ngl", "999", "-c", "16384", "-fa", "on", "--jinja"]
+    },
+    {
       "name": "my-gguf-model",
       "backend": "llama-server",
       "modelPath": "/models/my-model.gguf",
@@ -33,6 +44,18 @@
         "--cache-type-v", "q8_0",
         "-np", "1",
         "--jinja"
+      ]
+    },
+    {
+      "name": "my-moe-model",
+      "backend": "freetoken",
+      "modelPath": "org/big-moe-model",
+      "parameterCount": 284,
+      "gpu": 0,
+      "idleTimeout": 300000,
+      "extraArgs": [
+        "--memory-ratio", "0.85",
+        "--moe-backend", "offload"
       ]
     }
   ],

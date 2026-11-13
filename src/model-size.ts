@@ -245,6 +245,23 @@ function intArg(extraArgs: string[] | undefined, fallback: number, ...flags: str
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+/** FreeToken's own default for --memory-ratio. */
+const FREETOKEN_MEMORY_RATIO = 0.9;
+
+/** Card size assumed when the driver won't name one, as gpu-lock assumes too. */
+const UNKNOWN_CARD_TOTAL_GB = 24;
+
+/** Share of a card freetoken will fill, from its --memory-ratio flag. */
+function getMemoryRatio(extraArgs: string[] | undefined): number {
+  const ratio = parseFloat(argValue(extraArgs, "--memory-ratio") ?? "");
+  return Number.isFinite(ratio) && ratio > 0 ? ratio : FREETOKEN_MEMORY_RATIO;
+}
+
+/** What a freetoken model occupies on one card: --memory-ratio of it, no more. */
+function freetokenVRAM(extraArgs: string[] | undefined, cardTotalGB: number): number {
+  return Math.round(cardTotalGB * getMemoryRatio(extraArgs) * 100) / 100;
+}
+
 /**
  * Get GPU memory utilization from extraArgs.
  */
@@ -302,6 +319,21 @@ export function estimateVRAM(config: {
       paramsBillions = 14;
       confidence = "unknown";
     }
+  }
+
+  // FreeToken's weights never reach the card: an offloaded MoE keeps them in
+  // host RAM and caches only the hot experts here, up to --memory-ratio of the
+  // GPU. Sizing it from its parameters the way everything below does would put
+  // a 284B model's 140GB on a 24GB card's books and leave it unschedulable for
+  // good. resolveEstimate refines the card size; this is the blind guess.
+  if (config.backend === "freetoken") {
+    return {
+      parametersBillions: paramsBillions,
+      weightsGB: 0,
+      kvCacheGB: 0,
+      totalVRAM: freetokenVRAM(config.extraArgs, UNKNOWN_CARD_TOTAL_GB),
+      confidence: "inferred",
+    };
   }
 
   // For MoE: activated params drive activation overhead; total params drive weights
@@ -509,7 +541,8 @@ function ggufEstimate(
  * vramGB, then the GGUF header on disk, then the same header fetched from
  * HuggingFace when the file isn't downloaded yet, and finally the
  * parameter-count heuristic. The remote step is what lets admission run before
- * a download.
+ * a download. A freetoken model skips the ladder below vramGB entirely: what it
+ * holds follows the card it runs on, not the weights it serves.
  *
  * vramGB outranks the parsers because it is a human overruling them: it gets
  * set precisely when an automatic estimate came out wrong, so letting an
@@ -521,6 +554,19 @@ function ggufEstimate(
 export async function resolveEstimate(config: ModelConfig): Promise<ModelSizeEstimate> {
   if (config.vramGB !== undefined) {
     return { ...estimateVRAM(config), totalVRAM: config.vramGB, confidence: "manual" };
+  }
+
+  // A freetoken model is sized by the card it runs on rather than by its own
+  // weights (see estimateVRAM); the driver is the only place that card's size
+  // comes from. When it can't say, the 24GB assumption made there stands.
+  if (config.backend === "freetoken") {
+    const gpu = config.gpus?.[0] ?? config.gpu;
+    const info = (await getGpuInfo()).find((g) => g.index === gpu);
+    if (!info) return estimateVRAM(config);
+    return {
+      ...estimateVRAM(config),
+      totalVRAM: freetokenVRAM(config.extraArgs, info.totalMemoryMB / 1024),
+    };
   }
 
   if (config.backend === "llama-server") {

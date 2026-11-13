@@ -2,8 +2,8 @@
  * Process Manager — starts, supervises and stops backend inference servers.
  *
  * One class drives every backend; what differs between vLLM, llama-server,
- * SGLang and the parakeet ASR sidecar (binary, args, env, ready log, health
- * path) lives in BACKENDS.
+ * SGLang, FreeToken and the parakeet ASR sidecar (binary, args, env, ready log,
+ * health path) lives in BACKENDS.
  *
  * Two invariants the rest of the router depends on:
  *   - stdout/stderr are drained for the whole life of the child. A pipe nobody
@@ -127,6 +127,10 @@ function ncclEnv(config: ModelConfig): Record<string, string> {
  * Transformers, and ~/vllm-env must not be perturbed to add it.
  */
 const PARAKEET_PYTHON = process.env.PARAKEET_PYTHON || `${process.env.HOME}/parakeet-env/bin/python`;
+// FreeToken JIT-compiles CUDA kernels on first serve and needs a consistent
+// CUDA toolchain + CUDA_HOME/LIBRARY_PATH/LD_LIBRARY_PATH. Point FREETOKEN_BIN at
+// a wrapper that sets that env (e.g. ~/freetoken-env/ft-cuda.sh); defaults to bare `ft`.
+const FREETOKEN_BIN = process.env.FREETOKEN_BIN || "ft";
 const PARAKEET_SERVER = new URL("../servers/parakeet_server.py", import.meta.url).pathname;
 
 /**
@@ -249,6 +253,28 @@ const BACKENDS: Record<string, BackendDescriptor> = {
       text.includes("The server is fired up") ||
       text.includes("Uvicorn running") ||
       text.includes("Application startup complete"),
+  },
+
+  freetoken: {
+    label: "FreeToken",
+    binary: FREETOKEN_BIN,
+    // Confirmed against ft 0.1.2: /health returns 200 (cheaper than /v1/models,
+    // and won't 200 mid-load the way /v1/models can).
+    healthPath: "/health",
+    supportsSleep: false,
+    buildArgs: (config, port) => [
+      "serve",
+      "--model", config.modelPath,
+      "--host", "127.0.0.1",
+      "--port", port.toString(),
+      // --memory-ratio, --moe-backend and the rest stay in extraArgs: how much
+      // of the card an offloaded MoE may use is the user's call, not ours.
+      ...(config.extraArgs || []),
+    ],
+    buildEnv: (config) => ({
+      CUDA_VISIBLE_DEVICES: cudaDevices(config),
+    }),
+    isReadyLog: (text) => text.includes("API server is ready to serve"),
   },
 
   "parakeet-asr": {

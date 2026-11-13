@@ -1,8 +1,37 @@
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en">
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="color-scheme" content="dark light" />
+		<!--
+			The app is client-rendered (ssr = false), so mode-watcher's own head script
+			never makes it into the initial HTML — resolve the theme here to avoid a
+			flash. Seeding the key also makes <ModeWatcher defaultMode="dark" /> stick:
+			mode-watcher writes "system" to storage at module init, before it reads the
+			prop, so an unset key would always resolve to the OS preference.
+		-->
+		<script>
+			(() => {
+				try {
+					let stored = localStorage.getItem('mode-watcher-mode');
+					if (stored !== 'light' && stored !== 'dark' && stored !== 'system') {
+						stored = 'dark';
+						localStorage.setItem('mode-watcher-mode', stored);
+					}
+					const mode =
+						stored === 'system'
+							? window.matchMedia('(prefers-color-scheme: light)').matches
+								? 'light'
+								: 'dark'
+							: stored;
+					document.documentElement.classList.toggle('dark', mode === 'dark');
+					document.documentElement.style.colorScheme = mode;
+				} catch {
+					document.documentElement.classList.add('dark');
+				}
+			})();
+		</script>
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">

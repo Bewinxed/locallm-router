@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <strong>vLLM</strong> &bull; <strong>llama.cpp</strong> &bull; <strong>SGLang</strong> &mdash; one port, any model, on demand.
+  <strong>vLLM</strong> &bull; <strong>llama.cpp</strong> &bull; <strong>SGLang</strong> &bull; <strong>FreeToken</strong> &mdash; one port, any model, on demand.
 </p>
 
 ---
@@ -20,7 +20,7 @@ You configure a list of models. When a request comes in with `"model": "my-model
 
 1. **Downloads** the model from HuggingFace (if not cached)
 2. **Evicts** idle models from the GPU if VRAM is tight
-3. **Starts** the right backend (vLLM, llama-server, or SGLang)
+3. **Starts** the right backend (vLLM, llama-server, SGLang, or FreeToken)
 4. **Proxies** the request to the running backend
 5. **Idles out** the model after a configurable timeout
 
@@ -28,7 +28,7 @@ No model runs until something asks for it. No VRAM wasted on models nobody is us
 
 ## Features
 
-- **Multi-backend** &mdash; vLLM, llama.cpp (GGUF), and SGLang behind one unified API
+- **Multi-backend** &mdash; vLLM, llama.cpp (GGUF), SGLang, and FreeToken (`ft`, edge MoE) behind one unified API
 - **Lazy lifecycle** &mdash; models download, start, and stop automatically
 - **VRAM-aware scheduling** &mdash; GPU lock tracks estimated VRAM per model, evicts LRU when needed
 - **Multi-GPU** &mdash; tensor parallel for large models, or spread different models across GPUs
@@ -38,6 +38,27 @@ No model runs until something asks for it. No VRAM wasted on models nobody is us
 - **Idle sweep** &mdash; models that go unused get stopped and their VRAM reclaimed
 
 ## Quick start
+
+### CLI (native)
+
+Runs the router directly on your machine — needs [Bun](https://bun.sh), plus
+`llama-server` on your PATH for GGUF models (and/or `vllm` for vLLM models):
+
+```bash
+bunx locallm-router init      # scaffold ~/.config/locallm-router/config.json
+bunx locallm-router doctor    # check backends, GPUs, config
+bunx locallm-router up        # run in the foreground
+
+# Run automatically at login (systemd user unit on Linux, launchd on macOS):
+bunx locallm-router service install
+# Optional on Linux — start at boot without logging in:
+loginctl enable-linger $USER
+```
+
+`locallm-router status` and `locallm-router stop-all` work from any terminal
+while the service runs.
+
+### Docker
 
 ```bash
 git clone https://github.com/Bewinxed/locallm-router.git
@@ -70,6 +91,15 @@ The proxy listens on **:30000**, the dashboard on **:30001**, and the management
       "idleTimeout": 300000,    // 5 minutes
       "dtype": "bfloat16",
       "extraArgs": ["--gpu-memory-utilization", "0.85"]
+    },
+    {
+      "name": "qwythos-27b",
+      "backend": "llama-server",
+      "modelPath": "empero-ai/Qwythos-27B-v1-GGUF", // GGUF repo…
+      "modelFile": "Qwythos-27B-Q4_K_M.gguf",       // …download ONLY this quant
+      "gpu": 0,
+      "idleTimeout": 600000,
+      "extraArgs": ["-ngl", "999", "-c", "16384", "-fa", "on", "--jinja"]
     },
     {
       "name": "my-gguf",
@@ -135,8 +165,13 @@ curl ... -d '{"model": "my-gguf:gpu1", ...}'
 | `POST /start/<model>` | Force start a model |
 | `POST /stop/<model>` | Force stop a model |
 | `POST /stop-all` | Stop all running models |
-| `POST /restart/<model>` | Restart with fresh config |
+| `POST /restart/<model>` | Restart with fresh config. `?context=N` or `{ "overrides": { "-c": "N" } }` |
 | `POST /reload-config/<model>` | Hot reload config from disk |
+
+The same endpoints are also served under `/manager/*` on the proxy port
+(`:30000/manager/status`, …). Because they start and stop processes, port
+30099 binds to `127.0.0.1` — set `ROUTER_MGMT_HOST=0.0.0.0` to expose it
+(docker-compose.yml already does).
 
 ## Architecture
 
